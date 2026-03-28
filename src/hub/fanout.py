@@ -81,7 +81,7 @@ class FanOutEngine:
 
         # Sequential send with small delay to avoid overwhelming the LLM proxy
         # (parallel fan-out can trigger rate limits when all agents call the same proxy)
-        fan_out_delay = float(os.environ.get("FANOUT_DELAY_SECONDS", "1.0"))
+        fan_out_delay = float(os.environ.get("FANOUT_DELAY_SECONDS", "5.0"))
         results: list[FanOutResult] = []
         for i, member in enumerate(sendable):
             result = await self._send_to_agent(
