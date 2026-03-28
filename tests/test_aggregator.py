@@ -85,3 +85,79 @@ class TestVotingStrategy:
         assert task.artifacts  # should have voting summary
         summary_text = task.artifacts[0].parts[0].root.text
         assert "approve" in summary_text.lower()
+
+    def test_voting_tie(self):
+        results = [
+            FanOutResult(agent_id="a", agent_name="A", response_text="approve"),
+            FanOutResult(agent_id="b", agent_name="B", response_text="reject"),
+        ]
+        agg = Aggregator()
+        task = agg.aggregate(results, strategy=AggregationStrategy.voting,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        text = task.artifacts[0].parts[0].root.text
+        assert "1/2 votes" in text
+
+    def test_voting_no_valid_votes(self):
+        results = [
+            FanOutResult(agent_id="a", agent_name="A", error="timeout"),
+            FanOutResult(agent_id="b", agent_name="B", error="refused"),
+        ]
+        agg = Aggregator()
+        task = agg.aggregate(results, strategy=AggregationStrategy.voting,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        text = task.artifacts[0].parts[0].root.text
+        assert "no valid votes" in text.lower()
+
+    def test_voting_case_insensitive(self):
+        results = [
+            FanOutResult(agent_id="a", agent_name="A", response_text="Approve"),
+            FanOutResult(agent_id="b", agent_name="B", response_text="approve"),
+            FanOutResult(agent_id="c", agent_name="C", response_text="APPROVE"),
+        ]
+        agg = Aggregator()
+        task = agg.aggregate(results, strategy=AggregationStrategy.voting,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        text = task.artifacts[0].parts[0].root.text
+        assert "3/3 votes" in text
+
+
+class TestFirstStrategyEdgeCases:
+    def test_first_all_errors_returns_first_error(self):
+        results = [
+            FanOutResult(agent_id="a", agent_name="A", error="timeout"),
+            FanOutResult(agent_id="b", agent_name="B", error="refused"),
+        ]
+        agg = Aggregator()
+        task = agg.aggregate(results, strategy=AggregationStrategy.first,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        assert len(task.artifacts) == 1
+        assert "timeout" in task.artifacts[0].parts[0].root.text
+
+    def test_first_empty_results(self):
+        agg = Aggregator()
+        task = agg.aggregate([], strategy=AggregationStrategy.first,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        assert task.artifacts == []
+
+
+class TestEmptyResults:
+    def test_all_strategy_empty(self):
+        agg = Aggregator()
+        task = agg.aggregate([], strategy=AggregationStrategy.all,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        assert task.artifacts == []
+        assert task.metadata["peer_count"] == 0
+
+    def test_voting_strategy_empty(self):
+        agg = Aggregator()
+        task = agg.aggregate([], strategy=AggregationStrategy.voting,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        text = task.artifacts[0].parts[0].root.text
+        assert "no valid votes" in text.lower()
+
+    def test_consensus_empty_falls_back(self):
+        agg = Aggregator()
+        task = agg.aggregate([], strategy=AggregationStrategy.consensus,
+                             task_id="t1", context_id="c1", channel_id="dev", channel_name="dev-team")
+        assert task.metadata["strategy"] == "all"
+        assert task.artifacts == []

@@ -1,9 +1,14 @@
 # tests/test_hub_handler.py
 """Tests for GroupChatHub handler — the A2A RequestHandler."""
 
+import uuid
+
 import pytest
 from unittest.mock import AsyncMock
-from a2a.types import Message, MessageSendParams, Part, Role, TextPart, Task
+from a2a.types import (
+    Message, MessageSendParams, Part, Role, Task, TaskArtifactUpdateEvent,
+    TaskIdParams, TaskQueryParams, TaskState, TaskStatusUpdateEvent, TextPart,
+)
 
 from src.channels.models import Channel, ChannelMember, MemberRole
 from src.channels.registry import ChannelRegistry
@@ -84,3 +89,194 @@ class TestOnMessageSend:
         await hub.on_message_send(params)
         messages = await storage.get_messages("dev")
         assert len(messages) >= 1
+
+
+class TestOnMessageSendStream:
+    async def test_yields_working_artifacts_completed(self, hub_setup):
+        hub, _, _ = hub_setup
+        hub._fanout_engine.fan_out = AsyncMock(return_value=[
+            FanOutResult(agent_id="rex", agent_name="Rex", response_text="Got it"),
+        ])
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello team"))],
+                message_id="msg-1",
+                metadata={"channel_id": "dev", "sender_id": "apollo"},
+            ),
+        )
+        events = []
+        async for event in hub.on_message_send_stream(params):
+            events.append(event)
+
+        assert len(events) >= 3
+        assert isinstance(events[0], TaskStatusUpdateEvent)
+        assert events[0].status.state == TaskState.working
+        assert isinstance(events[1], TaskArtifactUpdateEvent)
+        assert isinstance(events[-1], TaskStatusUpdateEvent)
+        assert events[-1].status.state == TaskState.completed
+
+    async def test_stream_error_channel(self, hub_setup):
+        hub, _, _ = hub_setup
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"channel_id": "nonexistent"},
+            ),
+        )
+        events = []
+        async for event in hub.on_message_send_stream(params):
+            events.append(event)
+
+        assert len(events) == 1
+        assert isinstance(events[0], Message)
+
+    async def test_stream_permission_denied(self, hub_setup):
+        hub, registry, _ = hub_setup
+        await registry.add_member("dev", ChannelMember(
+            agent_id="vigil", name="Vigil", url="http://localhost:9003", role=MemberRole.observer,
+        ))
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"channel_id": "dev", "sender_id": "vigil"},
+            ),
+        )
+        events = []
+        async for event in hub.on_message_send_stream(params):
+            events.append(event)
+
+        assert len(events) == 1
+        assert isinstance(events[0], Message)
+        assert "permission" in events[0].parts[0].root.text.lower() or "observer" in events[0].parts[0].root.text.lower()
+
+
+class TestOnGetTask:
+    async def test_get_existing_task(self, hub_setup):
+        hub, _, _ = hub_setup
+        hub._fanout_engine.fan_out = AsyncMock(return_value=[
+            FanOutResult(agent_id="rex", agent_name="Rex", response_text="Response"),
+        ])
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"channel_id": "dev", "sender_id": "apollo"},
+            ),
+        )
+        result = await hub.on_message_send(params)
+        assert isinstance(result, Task)
+
+        retrieved = await hub.on_get_task(TaskQueryParams(id=result.id))
+        assert retrieved is not None
+        assert retrieved.id == result.id
+
+    async def test_get_nonexistent_task(self, hub_setup):
+        hub, _, _ = hub_setup
+        retrieved = await hub.on_get_task(TaskQueryParams(id="nonexistent"))
+        assert retrieved is None
+
+
+class TestOnCancelTask:
+    async def test_cancel_existing_task(self, hub_setup):
+        hub, _, _ = hub_setup
+        hub._fanout_engine.fan_out = AsyncMock(return_value=[
+            FanOutResult(agent_id="rex", agent_name="Rex", response_text="Response"),
+        ])
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"channel_id": "dev", "sender_id": "apollo"},
+            ),
+        )
+        result = await hub.on_message_send(params)
+        assert isinstance(result, Task)
+
+        cancelled = await hub.on_cancel_task(TaskIdParams(id=result.id))
+        assert cancelled is not None
+        assert cancelled.status.state == TaskState.canceled
+
+    async def test_cancel_nonexistent_task(self, hub_setup):
+        hub, _, _ = hub_setup
+        cancelled = await hub.on_cancel_task(TaskIdParams(id="nonexistent"))
+        assert cancelled is None
+
+
+class TestStrategyFromMetadata:
+    async def test_aggregation_strategy_from_message_metadata(self, hub_setup):
+        hub, _, _ = hub_setup
+        hub._fanout_engine.fan_out = AsyncMock(return_value=[
+            FanOutResult(agent_id="rex", agent_name="Rex", response_text="Response 1"),
+        ])
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"channel_id": "dev", "sender_id": "apollo", "aggregation": "first"},
+            ),
+        )
+        result = await hub.on_message_send(params)
+        assert isinstance(result, Task)
+        assert result.metadata["strategy"] == "first"
+
+    async def test_invalid_strategy_falls_back_to_all(self, hub_setup):
+        hub, _, _ = hub_setup
+        hub._fanout_engine.fan_out = AsyncMock(return_value=[
+            FanOutResult(agent_id="rex", agent_name="Rex", response_text="Response"),
+        ])
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"channel_id": "dev", "sender_id": "apollo", "aggregation": "bogus"},
+            ),
+        )
+        result = await hub.on_message_send(params)
+        assert isinstance(result, Task)
+        assert result.metadata["strategy"] == "all"
+
+
+class TestContextIdResolution:
+    async def test_resolve_via_context_id(self, hub_setup):
+        hub, registry, _ = hub_setup
+        ch = await registry.get_channel("dev")
+        context_id = ch.context_id
+
+        hub._fanout_engine.fan_out = AsyncMock(return_value=[
+            FanOutResult(agent_id="rex", agent_name="Rex", response_text="Found via context"),
+        ])
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello via context"))],
+                message_id="msg-1",
+                metadata={"sender_id": "apollo"},
+                context_id=context_id,
+            ),
+        )
+        result = await hub.on_message_send(params)
+        assert isinstance(result, Task)
+
+    async def test_context_id_not_matching(self, hub_setup):
+        hub, _, _ = hub_setup
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="Hello"))],
+                message_id="msg-1",
+                metadata={"sender_id": "apollo"},
+                context_id="nonexistent-context-id",
+            ),
+        )
+        result = await hub.on_message_send(params)
+        assert isinstance(result, Message)
+        assert "error" in result.parts[0].root.text.lower() or "Error" in result.parts[0].root.text
