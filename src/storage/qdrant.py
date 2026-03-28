@@ -1,9 +1,10 @@
 # src/storage/qdrant.py
-"""Qdrant storage backend — message history with semantic search via FastEmbed."""
+"""Qdrant storage backend — message history with semantic search via Voyage AI."""
 
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -19,10 +20,10 @@ except ImportError:
     _HAS_QDRANT = False
 
 try:
-    from fastembed import TextEmbedding
-    _HAS_FASTEMBED = True
+    import voyageai
+    _HAS_VOYAGE = True
 except ImportError:
-    _HAS_FASTEMBED = False
+    _HAS_VOYAGE = False
 
 
 class QdrantBackend(StorageBackend):
@@ -33,15 +34,24 @@ class QdrantBackend(StorageBackend):
     """
 
     COLLECTION = "hub_messages"
-    EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-    VECTOR_SIZE = 384
+    EMBEDDING_MODEL = "voyage-3-lite"
+    VECTOR_SIZE = 1024
 
     def __init__(self, url: str = "http://localhost:6333", collection: str | None = None):
         if not _HAS_QDRANT:
-            raise ImportError("qdrant-client not installed. pip install qdrant-client fastembed")
+            raise ImportError("qdrant-client not installed. pip install qdrant-client voyageai")
         self._url = url
         self._collection = collection or self.COLLECTION
-        self._client = QdrantClient(url=url, prefer_grpc=False)
+        self._client = QdrantClient(url=url, timeout=5)
+        self._voyage = None
+        if _HAS_VOYAGE:
+            api_key = os.environ.get("VOYAGE_API_KEY", "")
+            if api_key:
+                self._voyage = voyageai.Client(api_key=api_key)
+            else:
+                logger.warning("VOYAGE_API_KEY not set — embeddings disabled, semantic search unavailable")
+        else:
+            logger.warning("voyageai not installed — embeddings disabled")
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
@@ -57,19 +67,28 @@ class QdrantBackend(StorageBackend):
             )
             logger.info(f"Created Qdrant collection: {self._collection}")
 
-    def _embed(self, text: str) -> list[float]:
-        """Generate embedding using FastEmbed (local, no API key)."""
-        if not hasattr(self, "_embedder"):
-            if not _HAS_FASTEMBED:
-                raise ImportError("fastembed not installed. pip install fastembed")
-            self._embedder = TextEmbedding(model_name=self.EMBEDDING_MODEL)
-        embeddings = list(self._embedder.embed([text]))
-        return embeddings[0].tolist()
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts using Voyage AI. Returns empty list on failure."""
+        if not texts:
+            return []
+        if not self._voyage:
+            logger.warning("Voyage client not available — skipping embedding")
+            return []
+        try:
+            result = self._voyage.embed(texts, model=self.EMBEDDING_MODEL)
+            return result.embeddings
+        except Exception:
+            logger.exception("Voyage AI embedding failed")
+            return []
 
     # -- Messages --
 
     async def save_message(self, channel_id: str, message: StoredMessage) -> None:
-        vector = self._embed(message.text)
+        vectors = self._embed([message.text])
+        if not vectors:
+            logger.warning("No embedding produced — skipping save for message %s", message.message_id)
+            return
+        vector = vectors[0]
         payload = {
             "message_id": message.message_id,
             "channel_id": message.channel_id or channel_id,
@@ -107,7 +126,10 @@ class QdrantBackend(StorageBackend):
         return [self._point_to_message(p) for p in results]
 
     async def search_messages(self, channel_id: str, query: str, limit: int = 10) -> list[StoredMessage]:
-        vector = self._embed(query)
+        vectors = self._embed([query])
+        if not vectors:
+            return []
+        vector = vectors[0]
         results = self._client.query_points(
             collection_name=self._collection,
             query=vector,
@@ -123,7 +145,10 @@ class QdrantBackend(StorageBackend):
 
     async def search_all_messages(self, query: str, limit: int = 10) -> list[StoredMessage]:
         """Search across ALL channels — for knowledge agents."""
-        vector = self._embed(query)
+        vectors = self._embed([query])
+        if not vectors:
+            return []
+        vector = vectors[0]
         results = self._client.query_points(
             collection_name=self._collection,
             query=vector,
@@ -133,18 +158,28 @@ class QdrantBackend(StorageBackend):
 
     def _point_to_message(self, point) -> StoredMessage:
         p = point.payload
+        raw_ts = p.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(raw_ts) if raw_ts else datetime.now(timezone.utc)
+            timestamp = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            timestamp = datetime.now(timezone.utc)
         return StoredMessage(
             message_id=p["message_id"],
             channel_id=p["channel_id"],
             sender_id=p["sender_id"],
             text=p["text"],
             context_id=p["context_id"],
-            timestamp=p.get("timestamp", ""),
+            timestamp=timestamp,
             metadata=p.get("metadata", {}),
             project_id=p.get("project_id"),
             tags=p.get("tags", []),
             reply_to_message_id=p.get("reply_to_message_id"),
         )
+
+    async def close(self) -> None:
+        """Close Qdrant client. qdrant-client handles cleanup internally."""
+        pass
 
     # -- Channel/Member/Webhook stubs (handled by Neo4j in composite) --
 
