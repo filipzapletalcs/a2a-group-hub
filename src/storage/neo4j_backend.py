@@ -128,8 +128,9 @@ class Neo4jBackend(StorageBackend):
     async def save_member(self, channel_id: str, member: ChannelMember) -> None:
         query = """
         MATCH (c:HubChannel {channel_id: $channel_id})
-        MERGE (a:Agent {agent_id: $agent_id})
-        ON CREATE SET a.name = $name, a.url = $url
+        MERGE (a:Agent {name: $name})
+        ON CREATE SET a.agent_id = $agent_id, a.url = $url
+        ON MATCH SET a.agent_id = $agent_id, a.url = $url
         MERGE (c)-[r:HAS_MEMBER]->(a)
         SET r.role = $role,
             r.joined_at = datetime(),
