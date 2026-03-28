@@ -54,6 +54,13 @@ class InMemoryBackend(StorageBackend):
         query_lower = query.lower()
         return [m for m in msgs if query_lower in m.text.lower()][:limit]
 
+    async def search_all_messages(self, query: str, limit: int = 10) -> list[StoredMessage]:
+        query_lower = query.lower()
+        results: list[StoredMessage] = []
+        for msgs in self._messages.values():
+            results.extend(m for m in msgs if query_lower in m.text.lower())
+        return results[:limit]
+
     async def save_webhook(self, channel_id: str, webhook: Webhook) -> None:
         self._webhooks.setdefault(channel_id, []).append(webhook)
 
