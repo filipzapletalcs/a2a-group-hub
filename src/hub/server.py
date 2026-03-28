@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -20,6 +21,7 @@ from src.channels.registry import ChannelRegistry
 from src.hub.handler import GroupChatHub
 from src.storage.memory import InMemoryBackend
 from src.storage.base import StorageBackend
+from src.bootstrap import bootstrap_channels
 
 logger = logging.getLogger("a2a-hub.server")
 
@@ -62,8 +64,22 @@ def create_app(storage_backend: str = "memory") -> Starlette:
     """Factory that builds the full Starlette application."""
 
     # Storage
-    if storage_backend == "memory":
-        storage: StorageBackend = InMemoryBackend()
+    if storage_backend == "composite":
+        from src.storage.neo4j_backend import Neo4jBackend
+        from src.storage.qdrant import QdrantBackend
+        from src.storage.composite import CompositeBackend
+
+        neo4j = Neo4jBackend(
+            url=os.environ.get("NEO4J_URL", "bolt://localhost:7687"),
+            user=os.environ.get("NEO4J_USER", "neo4j"),
+            password=os.environ.get("NEO4J_PASSWORD", "password"),
+        )
+        qdrant = QdrantBackend(
+            url=os.environ.get("QDRANT_URL", "http://localhost:6333"),
+        )
+        storage: StorageBackend = CompositeBackend(neo4j_backend=neo4j, qdrant_backend=qdrant)
+    elif storage_backend == "memory":
+        storage = InMemoryBackend()
     else:
         logger.warning(
             f"Requested storage backend '{storage_backend}' is not available. "
