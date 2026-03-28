@@ -2,9 +2,10 @@
 """Tests for GroupChatHub handler — the A2A RequestHandler."""
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from a2a.types import (
     Message, MessageSendParams, Part, Role, Task, TaskArtifactUpdateEvent,
     TaskIdParams, TaskQueryParams, TaskState, TaskStatusUpdateEvent, TextPart,
@@ -14,6 +15,7 @@ from src.channels.models import Channel, ChannelMember, MemberRole
 from src.channels.registry import ChannelRegistry
 from src.hub.handler import GroupChatHub
 from src.hub.fanout import FanOutResult
+from src.storage.base import StoredMessage
 from src.storage.memory import InMemoryBackend
 
 
@@ -280,3 +282,114 @@ class TestContextIdResolution:
         result = await hub.on_message_send(params)
         assert isinstance(result, Message)
         assert "error" in result.parts[0].root.text.lower() or "Error" in result.parts[0].root.text
+
+
+class TestMemoryRecall:
+    async def test_recall_memory_dedup_by_message_id(self, hub_setup):
+        """Two messages with same text but different IDs — only the incoming one is filtered."""
+        hub, _, storage = hub_setup
+        ch = await hub.registry.get_channel("dev")
+
+        # Seed two messages with identical text but different message_ids
+        await storage.save_message("dev", StoredMessage(
+            message_id="msg-A", channel_id="dev", sender_id="rex",
+            text="OK", context_id=ch.context_id,
+        ))
+        await storage.save_message("dev", StoredMessage(
+            message_id="msg-B", channel_id="dev", sender_id="nova",
+            text="OK", context_id=ch.context_id,
+        ))
+
+        # Recall with message_id="msg-A" should exclude msg-A but keep msg-B
+        result = await hub._recall_memory(ch, "OK", "msg-A")
+        assert "nova" in result
+        # msg-A (rex) should be filtered out by dedup
+        # But both have text "OK" — old text-based dedup would remove both
+
+    async def test_recall_memory_no_results(self, hub_setup):
+        """When no past messages match, return empty string."""
+        hub, _, _ = hub_setup
+        ch = await hub.registry.get_channel("dev")
+        result = await hub._recall_memory(ch, "completely unique query", "msg-1")
+        assert result == ""
+
+    async def test_recall_memory_method_directly(self, hub_setup):
+        """Unit test _recall_memory returns formatted context with timestamps."""
+        hub, _, storage = hub_setup
+        ch = await hub.registry.get_channel("dev")
+
+        await storage.save_message("dev", StoredMessage(
+            message_id="msg-100", channel_id="dev", sender_id="pixel",
+            text="The deploy is ready", context_id=ch.context_id,
+            timestamp=datetime(2026, 3, 28, 10, 30, tzinfo=timezone.utc),
+        ))
+
+        result = await hub._recall_memory(ch, "deploy", "msg-other")
+        assert "pixel" in result
+        assert "28.03 10:30" in result
+        assert "deploy" in result.lower()
+        assert result.startswith("[Relevantní historie")
+
+    async def test_memory_recall_in_on_message_send(self, hub_setup):
+        """on_message_send passes memory_context in metadata to fan-out."""
+        hub, _, storage = hub_setup
+        ch = await hub.registry.get_channel("dev")
+
+        # Seed a past message (text must contain the incoming query as substring for InMemory search)
+        await storage.save_message("dev", StoredMessage(
+            message_id="past-1", channel_id="dev", sender_id="rex",
+            text="testing the deploy pipeline", context_id=ch.context_id,
+        ))
+
+        captured_metadata = {}
+
+        async def mock_fan_out(channel, message_parts, sender_id, context_id, message_metadata=None):
+            captured_metadata.update(message_metadata or {})
+            return [FanOutResult(agent_id="rex", agent_name="Rex", response_text="Got it")]
+
+        hub._fanout_engine.fan_out = mock_fan_out
+
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="testing"))],
+                message_id="msg-new",
+                metadata={"channel_id": "dev", "sender_id": "apollo"},
+            ),
+        )
+        await hub.on_message_send(params)
+        assert "memory_context" in captured_metadata
+        assert "rex" in captured_metadata["memory_context"]
+
+    async def test_memory_recall_stream_path(self, hub_setup):
+        """on_message_send_stream also calls _recall_memory and passes context."""
+        hub, _, storage = hub_setup
+        ch = await hub.registry.get_channel("dev")
+
+        await storage.save_message("dev", StoredMessage(
+            message_id="past-2", channel_id="dev", sender_id="nova",
+            text="architecture overview and design", context_id=ch.context_id,
+        ))
+
+        captured_metadata = {}
+
+        async def mock_fan_out(channel, message_parts, sender_id, context_id, message_metadata=None):
+            captured_metadata.update(message_metadata or {})
+            return [FanOutResult(agent_id="rex", agent_name="Rex", response_text="Ack")]
+
+        hub._fanout_engine.fan_out = mock_fan_out
+
+        params = MessageSendParams(
+            message=Message(
+                role=Role.user,
+                parts=[Part(root=TextPart(text="architecture"))],
+                message_id="msg-stream",
+                metadata={"channel_id": "dev", "sender_id": "apollo"},
+            ),
+        )
+        events = []
+        async for event in hub.on_message_send_stream(params):
+            events.append(event)
+
+        assert "memory_context" in captured_metadata
+        assert "nova" in captured_metadata["memory_context"]

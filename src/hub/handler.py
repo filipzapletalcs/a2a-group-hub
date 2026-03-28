@@ -61,6 +61,31 @@ class GroupChatHub(RequestHandler):
 
         return None, None
 
+    # -- Memory recall --------------------------------------------------------
+
+    async def _recall_memory(self, channel: Channel, text: str, message_id: str) -> str:
+        """Search for relevant past messages and return memory context."""
+        memory_context = ""
+        try:
+            past_messages = await self.storage.search_messages(
+                channel_id=channel.channel_id,
+                query=text,
+                limit=5,
+            )
+            past_messages = [m for m in past_messages if m.message_id != message_id]
+            if past_messages:
+                lines = []
+                for m in past_messages[:3]:
+                    ts = m.timestamp.strftime("%d.%m %H:%M") if hasattr(m.timestamp, 'strftime') else str(m.timestamp)[:16]
+                    lines.append(f"- {m.sender_id} ({ts}): {m.text[:300]}")
+                memory_context = "[Relevantní historie z kanálu #{}]\n{}".format(
+                    channel.name, "\n".join(lines)
+                )
+                logger.info("Memory recall: %d messages for #%s", len(past_messages), channel.name)
+        except Exception:
+            logger.debug("Memory recall unavailable")
+        return memory_context
+
     # -- Core handlers ------------------------------------------------------
 
     async def on_message_send(
@@ -97,8 +122,15 @@ class GroupChatHub(RequestHandler):
             context_id=channel.context_id,
         ))
 
+        # Memory recall
+        incoming_id = params.message.message_id or ""
+        memory_context = await self._recall_memory(channel, text, incoming_id)
+        msg_meta = dict(params.message.metadata or {})
+        if memory_context:
+            msg_meta["memory_context"] = memory_context
+
         # Fan-out
-        meta = params.message.metadata or {}
+        meta = msg_meta
         strategy_name = meta.get("aggregation", channel.default_aggregation)
         try:
             strategy = AggregationStrategy(strategy_name)
@@ -110,7 +142,7 @@ class GroupChatHub(RequestHandler):
             message_parts=params.message.parts,
             sender_id=sender_id,
             context_id=channel.context_id,
-            message_metadata=params.message.metadata,
+            message_metadata=msg_meta,
         )
 
         # Persist responses
@@ -164,6 +196,14 @@ class GroupChatHub(RequestHandler):
             )
             return
 
+        # Memory recall
+        text = self._extract_text(params.message)
+        incoming_id = params.message.message_id or ""
+        memory_context = await self._recall_memory(channel, text, incoming_id)
+        msg_meta = dict(params.message.metadata or {})
+        if memory_context:
+            msg_meta["memory_context"] = memory_context
+
         task_id = str(uuid.uuid4())
         peers = channel.get_sendable_peers(exclude_agent_id=sender_id)
 
@@ -188,7 +228,7 @@ class GroupChatHub(RequestHandler):
             message_parts=params.message.parts,
             sender_id=sender_id,
             context_id=channel.context_id,
-            message_metadata=params.message.metadata,
+            message_metadata=msg_meta,
         )
 
         for i, r in enumerate(results):
