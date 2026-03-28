@@ -1,0 +1,75 @@
+"""Prometheus-compatible metrics for the hub."""
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class MetricsCollector:
+    """Collects and exposes hub metrics in Prometheus text format."""
+
+    channels_total: int = 0
+    agents_total: int = 0
+    messages_total: int = 0
+    fanout_durations: list[float] = field(default_factory=list)
+    agent_errors: dict[str, int] = field(default_factory=dict)
+    strategy_usage: dict[str, int] = field(default_factory=dict)
+    webhook_success: int = 0
+    webhook_failure: int = 0
+    _start_time: float = field(default_factory=time.time)
+
+    def record_message(self) -> None:
+        self.messages_total += 1
+
+    def record_fanout_duration(self, duration: float) -> None:
+        self.fanout_durations.append(duration)
+
+    def record_agent_error(self, agent_id: str) -> None:
+        self.agent_errors[agent_id] = self.agent_errors.get(agent_id, 0) + 1
+
+    def record_strategy_usage(self, strategy: str) -> None:
+        self.strategy_usage[strategy] = self.strategy_usage.get(strategy, 0) + 1
+
+    def record_webhook_delivery(self, success: bool) -> None:
+        if success:
+            self.webhook_success += 1
+        else:
+            self.webhook_failure += 1
+
+    def update_counts(self, channels: int, agents: int) -> None:
+        self.channels_total = channels
+        self.agents_total = agents
+
+    def _percentile(self, values: list[float], p: float) -> float:
+        if not values:
+            return 0.0
+        sorted_vals = sorted(values)
+        idx = int(len(sorted_vals) * p / 100)
+        return sorted_vals[min(idx, len(sorted_vals) - 1)]
+
+    def to_prometheus(self) -> str:
+        """Render metrics in Prometheus text exposition format."""
+        lines = []
+        lines.append(f"a2a_hub_channels_total {self.channels_total}")
+        lines.append(f"a2a_hub_agents_total {self.agents_total}")
+        lines.append(f"a2a_hub_messages_total {self.messages_total}")
+
+        p50 = self._percentile(self.fanout_durations, 50)
+        p95 = self._percentile(self.fanout_durations, 95)
+        p99 = self._percentile(self.fanout_durations, 99)
+        lines.append(f'a2a_hub_fanout_duration_seconds{{quantile="0.5"}} {p50:.3f}')
+        lines.append(f'a2a_hub_fanout_duration_seconds{{quantile="0.95"}} {p95:.3f}')
+        lines.append(f'a2a_hub_fanout_duration_seconds{{quantile="0.99"}} {p99:.3f}')
+
+        for agent_id, count in self.agent_errors.items():
+            lines.append(f'a2a_hub_agent_errors_total{{agent="{agent_id}"}} {count}')
+
+        for strategy, count in self.strategy_usage.items():
+            lines.append(f'a2a_hub_aggregation_strategy_usage{{strategy="{strategy}"}} {count}')
+
+        lines.append(f'a2a_hub_webhook_deliveries_total{{status="success"}} {self.webhook_success}')
+        lines.append(f'a2a_hub_webhook_deliveries_total{{status="failure"}} {self.webhook_failure}')
+
+        uptime = time.time() - self._start_time
+        lines.append(f"a2a_hub_uptime_seconds {uptime:.1f}")
+
+        return "\n".join(lines) + "\n"
