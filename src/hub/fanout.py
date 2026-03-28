@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 
@@ -78,13 +79,19 @@ class FanOutEngine:
         if not sendable:
             return []
 
-        # Parallel send to members, collect results
-        tasks = [
-            self._send_to_agent(member, message_parts=message_parts, channel=channel,
-                                context_id=context_id, metadata=message_metadata)
-            for member in sendable
-        ]
-        return list(await asyncio.gather(*tasks))
+        # Sequential send with small delay to avoid overwhelming the LLM proxy
+        # (parallel fan-out can trigger rate limits when all agents call the same proxy)
+        fan_out_delay = float(os.environ.get("FANOUT_DELAY_SECONDS", "1.0"))
+        results: list[FanOutResult] = []
+        for i, member in enumerate(sendable):
+            result = await self._send_to_agent(
+                member, message_parts=message_parts, channel=channel,
+                context_id=context_id, metadata=message_metadata,
+            )
+            results.append(result)
+            if i < len(sendable) - 1 and fan_out_delay > 0:
+                await asyncio.sleep(fan_out_delay)
+        return results
 
     async def _send_to_agent(
         self,
