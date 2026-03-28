@@ -33,10 +33,12 @@ class LLMAgentExecutor(AgentExecutor):
         role: str = "researcher",
         api_key: str | None = None,
         max_history: int = 20,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> None:
         config = AGENT_CONFIGS.get(role, DEFAULT_CONFIG)
-        self._system_prompt = config["system_prompt"]
-        self._temperature = config["temperature"]
+        self._system_prompt = system_prompt or config["system_prompt"]
+        self._temperature = temperature if temperature is not None else config["temperature"]
         self._model = config["model"]
         self._max_history = max_history
         self._history: dict[str, list[dict[str, str]]] = defaultdict(list)

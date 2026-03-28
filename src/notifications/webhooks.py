@@ -19,9 +19,10 @@ class WebhookEvent:
 class WebhookDispatcher:
     """Fire-and-forget POST to registered webhook URLs."""
 
-    def __init__(self, http_client: httpx.AsyncClient | None = None):
+    def __init__(self, http_client: httpx.AsyncClient | None = None, metrics=None):
         self._http_client = http_client or httpx.AsyncClient(timeout=10.0)
         self._owns_client = http_client is None
+        self._metrics = metrics
 
     async def close(self):
         if self._owns_client:
@@ -44,5 +45,9 @@ class WebhookDispatcher:
             }
             resp = await self._http_client.post(url, json=payload)
             logger.info(f"Webhook {url}: {resp.status_code}")
+            if self._metrics:
+                self._metrics.record_webhook_delivery(success=True)
         except Exception as e:
             logger.error(f"Webhook delivery to {url} failed: {e}")
+            if self._metrics:
+                self._metrics.record_webhook_delivery(success=False)

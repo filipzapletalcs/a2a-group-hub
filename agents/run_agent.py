@@ -49,6 +49,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=9001, help="Port to listen on")
     parser.add_argument("--name", type=str, default=None, help="Agent name (defaults to role)")
     parser.add_argument("--api-key", type=str, default=None, help="Anthropic API key")
+    parser.add_argument("--system-prompt", type=str, default=None, help="Override system prompt")
+    parser.add_argument("--temperature", type=float, default=None, help="Override temperature")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
 
@@ -58,7 +60,10 @@ def main() -> None:
     if args.role == "echo":
         executor = DemoEchoExecutor()
     else:
-        executor = LLMAgentExecutor(role=args.role, api_key=args.api_key)
+        executor = LLMAgentExecutor(
+            role=args.role, api_key=args.api_key,
+            system_prompt=args.system_prompt, temperature=args.temperature,
+        )
 
     handler = DefaultRequestHandler(
         agent_executor=executor,

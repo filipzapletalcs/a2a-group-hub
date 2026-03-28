@@ -180,6 +180,37 @@ def create_app(storage_backend: str = "memory") -> Starlette:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
+    # -- Webhook API routes -------------------------------------------------
+
+    async def create_webhook(request: Request) -> JSONResponse:
+        channel_id = request.path_params["channel_id"]
+        ch = await registry.get_channel(channel_id)
+        if not ch:
+            return JSONResponse({"error": "Channel not found"}, status_code=404)
+        body = await request.json()
+        from src.storage.base import Webhook
+        import uuid as _uuid
+        wh = Webhook(
+            webhook_id=body.get("webhook_id", str(_uuid.uuid4())[:8]),
+            url=body["url"],
+            events=body.get("events", ["message"]),
+        )
+        await storage.save_webhook(channel_id, wh)
+        return JSONResponse({"webhook_id": wh.webhook_id, "url": wh.url, "events": wh.events}, status_code=201)
+
+    async def list_webhooks(request: Request) -> JSONResponse:
+        channel_id = request.path_params["channel_id"]
+        webhooks = await storage.list_webhooks(channel_id)
+        return JSONResponse([{"webhook_id": w.webhook_id, "url": w.url, "events": w.events} for w in webhooks])
+
+    async def delete_webhook(request: Request) -> JSONResponse:
+        channel_id = request.path_params["channel_id"]
+        webhook_id = request.path_params["webhook_id"]
+        deleted = await storage.delete_webhook(channel_id, webhook_id)
+        if not deleted:
+            return JSONResponse({"error": "Webhook not found"}, status_code=404)
+        return JSONResponse({"deleted": True})
+
     # -- Build app ----------------------------------------------------------
 
     routes = [
@@ -191,6 +222,9 @@ def create_app(storage_backend: str = "memory") -> Starlette:
         Route("/api/channels/{channel_id}/members", add_member, methods=["POST"]),
         Route("/api/channels/{channel_id}/members/{agent_id}", remove_member, methods=["DELETE"]),
         Route("/api/channels/{channel_id}/members/{agent_id}", patch_member, methods=["PATCH"]),
+        Route("/api/channels/{channel_id}/webhooks", create_webhook, methods=["POST"]),
+        Route("/api/channels/{channel_id}/webhooks", list_webhooks, methods=["GET"]),
+        Route("/api/channels/{channel_id}/webhooks/{webhook_id}", delete_webhook, methods=["DELETE"]),
         Route("/api/status", hub_status, methods=["GET"]),
     ]
 
