@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from a2a.types import Part, TextPart
 from src.channels.models import Channel, ChannelMember, MemberRole
-from src.hub.fanout import FanOutEngine, FanOutResult
+from src.hub.fanout import CircuitBreaker, FanOutEngine, FanOutResult
 
 
 @pytest.fixture
@@ -296,3 +296,87 @@ class TestSendToSingle:
 
             assert sent_text.startswith("[Custom context prefix]")
             assert sent_text.endswith("Hello")
+
+
+class TestFanOutCircuitBreaker:
+    """Tests for circuit breaker integration in FanOutEngine."""
+
+    async def test_fan_out_skips_circuit_broken_agent(self):
+        """Agents with open circuit breaker should be skipped with error."""
+        ch = Channel(channel_id="dev", name="dev-team")
+        ch.add_member(ChannelMember(agent_id="rex", name="Rex", url="http://localhost:9001"))
+        ch.add_member(ChannelMember(agent_id="pixel", name="Pixel", url="http://localhost:9002"))
+
+        cb = CircuitBreaker(failure_threshold=1)
+        cb.record_failure("rex")  # Open circuit for rex
+
+        engine = FanOutEngine(circuit_breaker=cb)
+        engine._send_to_agent = AsyncMock(
+            return_value=FanOutResult(agent_id="pixel", agent_name="Pixel", response_text="OK")
+        )
+
+        results = await engine.fan_out(ch, message_parts=[], sender_id=None, context_id="ctx")
+
+        # rex skipped (circuit open), pixel sent normally
+        assert len(results) == 2
+        rex_result = next(r for r in results if r.agent_id == "rex")
+        pixel_result = next(r for r in results if r.agent_id == "pixel")
+        assert rex_result.error == "circuit_breaker_open"
+        assert pixel_result.response_text == "OK"
+
+        # _send_to_agent should only have been called for pixel
+        engine._send_to_agent.assert_called_once()
+
+    async def test_fan_out_records_ack_on_success(self):
+        """Successful agent response should call record_success on circuit breaker."""
+        ch = Channel(channel_id="dev", name="dev-team")
+        ch.add_member(ChannelMember(agent_id="rex", name="Rex", url="http://localhost:9001"))
+
+        cb = CircuitBreaker()
+        engine = FanOutEngine(circuit_breaker=cb)
+        engine._send_to_agent = AsyncMock(
+            return_value=FanOutResult(agent_id="rex", agent_name="Rex", response_text="OK")
+        )
+
+        await engine.fan_out(ch, message_parts=[], sender_id=None, context_id="ctx")
+
+        # Agent should be in closed state (success recorded)
+        assert cb.get_state("rex") == "closed"
+
+    async def test_fan_out_records_nack_on_error(self):
+        """Failed agent response should call record_failure on circuit breaker."""
+        ch = Channel(channel_id="dev", name="dev-team")
+        ch.add_member(ChannelMember(agent_id="rex", name="Rex", url="http://localhost:9001"))
+
+        cb = CircuitBreaker(failure_threshold=3)
+        engine = FanOutEngine(circuit_breaker=cb)
+        engine._send_to_agent = AsyncMock(
+            return_value=FanOutResult(agent_id="rex", agent_name="Rex", error="Connection refused")
+        )
+
+        await engine.fan_out(ch, message_parts=[], sender_id=None, context_id="ctx")
+
+        # After one failure, should still be closed but have 1 failure recorded
+        state = cb._agents.get("rex")
+        assert state is not None
+        assert state.failures == 1
+        assert state.state == "closed"
+
+    async def test_send_to_single_skips_circuit_broken_agent(self):
+        """send_to_single should also respect circuit breaker."""
+        ch = Channel(channel_id="dev", name="dev-team")
+        member = ChannelMember(agent_id="rex", name="Rex", url="http://localhost:9001")
+        ch.add_member(member)
+
+        cb = CircuitBreaker(failure_threshold=1)
+        cb.record_failure("rex")  # Open circuit
+
+        engine = FanOutEngine(circuit_breaker=cb)
+        engine._send_to_agent = AsyncMock()
+
+        result = await engine.send_to_single(
+            member=member, message_parts=[], channel=ch, context_id="ctx",
+        )
+
+        assert result.error == "circuit_breaker_open"
+        engine._send_to_agent.assert_not_called()

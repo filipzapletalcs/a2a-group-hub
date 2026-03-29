@@ -23,7 +23,7 @@ from src.channels.models import Channel, MemberRole
 from src.channels.permissions import PermissionError, check_can_send
 from src.channels.registry import ChannelRegistry
 from src.hub.aggregator import Aggregator, AggregationStrategy
-from src.hub.fanout import FanOutEngine, FanOutResult
+from src.hub.fanout import CircuitBreaker, FanOutEngine, FanOutResult
 from src.storage.base import StorageBackend, StoredMessage
 
 # Router is optional — built by another agent, may not exist yet
@@ -46,7 +46,8 @@ class GroupChatHub(RequestHandler):
         self.registry = registry
         self.storage = storage
         self._router = router
-        self._fanout_engine = FanOutEngine()
+        self._circuit_breaker = CircuitBreaker()
+        self._fanout_engine = FanOutEngine(circuit_breaker=self._circuit_breaker)
         self._aggregator = Aggregator()
         self._tasks: dict[str, Task] = {}
 

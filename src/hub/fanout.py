@@ -6,8 +6,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from a2a.client import A2AClient
@@ -21,6 +22,67 @@ from src.channels.models import Channel, ChannelMember, MemberRole
 logger = logging.getLogger("a2a-hub.fanout")
 
 
+# ---------------------------------------------------------------------------
+# Circuit breaker — per-agent failure tracking with auto-recovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CircuitState:
+    """Tracks failure state for a single agent."""
+    failures: int = 0
+    last_failure: float = 0.0
+    state: str = "closed"  # closed, open, half-open
+
+
+class CircuitBreaker:
+    """Per-agent circuit breaker. Opens after consecutive failures, auto-recovers via half-open probe."""
+
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0) -> None:
+        self._threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._agents: dict[str, CircuitState] = {}
+
+    def should_skip(self, agent_id: str) -> bool:
+        """Return True if the agent's circuit is open and should be skipped."""
+        state = self._agents.get(agent_id)
+        if not state or state.state == "closed":
+            return False
+        if state.state == "open":
+            if time.time() - state.last_failure > self._recovery_timeout:
+                state.state = "half-open"
+                return False  # Allow probe
+            return True  # Still open, skip
+        return False  # half-open: allow probe
+
+    def record_success(self, agent_id: str) -> None:
+        """Record a successful call — resets circuit to closed."""
+        state = self._agents.get(agent_id)
+        if state:
+            state.failures = 0
+            state.state = "closed"
+
+    def record_failure(self, agent_id: str) -> None:
+        """Record a failed call — may open the circuit."""
+        state = self._agents.setdefault(agent_id, CircuitState())
+        state.failures += 1
+        state.last_failure = time.time()
+        if state.failures >= self._threshold:
+            state.state = "open"
+
+    def get_state(self, agent_id: str) -> str:
+        """Return circuit state for an agent (for metrics/logging)."""
+        state = self._agents.get(agent_id)
+        return state.state if state else "closed"
+
+    def get_all_states(self) -> dict[str, str]:
+        """Return all agent circuit states (for /health or metrics)."""
+        return {aid: s.state for aid, s in self._agents.items()}
+
+
+# ---------------------------------------------------------------------------
+# Fan-out results
+# ---------------------------------------------------------------------------
+
 @dataclass
 class FanOutResult:
     """Result from one agent in a fan-out broadcast."""
@@ -33,9 +95,19 @@ class FanOutResult:
 
 class FanOutEngine:
 
-    def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
         self._http_client = http_client or httpx.AsyncClient(timeout=120.0)
         self._owns_client = http_client is None
+        self._circuit_breaker = circuit_breaker or CircuitBreaker()
+
+    @property
+    def circuit_breaker(self) -> CircuitBreaker:
+        """Expose circuit breaker for handler/metrics access."""
+        return self._circuit_breaker
 
     async def close(self) -> None:
         if self._owns_client:
@@ -84,10 +156,36 @@ class FanOutEngine:
         fan_out_delay = float(os.environ.get("FANOUT_DELAY_SECONDS", "5.0"))
         results: list[FanOutResult] = []
         for i, member in enumerate(sendable):
+            # Circuit breaker check — skip agents with open circuits
+            if self._circuit_breaker.should_skip(member.agent_id):
+                logger.warning("Circuit breaker OPEN for %s -- skipping", member.name)
+                results.append(FanOutResult(
+                    agent_id=member.agent_id,
+                    agent_name=member.name,
+                    error="circuit_breaker_open",
+                ))
+                continue
+
             result = await self._send_to_agent(
                 member, message_parts=message_parts, channel=channel,
                 context_id=context_id, metadata=message_metadata,
             )
+
+            # ACK/NACK tracking
+            if result.error:
+                self._circuit_breaker.record_failure(member.agent_id)
+                logger.info(
+                    "NACK from %s: %s (circuit: %s)",
+                    member.name, result.error,
+                    self._circuit_breaker.get_state(member.agent_id),
+                )
+            else:
+                self._circuit_breaker.record_success(member.agent_id)
+                logger.info(
+                    "ACK from %s (%d chars)",
+                    member.name, len(result.response_text or ""),
+                )
+
             results.append(result)
             if i < len(sendable) - 1 and fan_out_delay > 0:
                 await asyncio.sleep(fan_out_delay)
@@ -104,6 +202,15 @@ class FanOutEngine:
         previous_responses: list[FanOutResult] | None = None,
     ) -> FanOutResult:
         """Send to a single agent with enriched context including previous responses."""
+        # Circuit breaker check
+        if self._circuit_breaker.should_skip(member.agent_id):
+            logger.warning("Circuit breaker OPEN for %s -- skipping", member.name)
+            return FanOutResult(
+                agent_id=member.agent_id,
+                agent_name=member.name,
+                error="circuit_breaker_open",
+            )
+
         # Build channel context prefix
         member_list = []
         for m in channel.members.values():
@@ -124,11 +231,19 @@ class FanOutEngine:
             if responses_text:
                 context_prefix += f"\n[Odpovědi v tomto kole]\n{responses_text}\n"
 
-        return await self._send_to_agent(
+        result = await self._send_to_agent(
             member, message_parts=message_parts, channel=channel,
             context_id=context_id, metadata=message_metadata,
             context_prefix_override=context_prefix,
         )
+
+        # ACK/NACK tracking
+        if result.error:
+            self._circuit_breaker.record_failure(member.agent_id)
+        else:
+            self._circuit_breaker.record_success(member.agent_id)
+
+        return result
 
     async def _send_to_agent(
         self,
