@@ -54,7 +54,7 @@ class HierarchicalRouter:
     async def _load_channel_leads(self) -> None:
         async with self._driver.session() as session:
             result = await session.run("""
-                MATCH (a:Agent)-[:OWNS_CHANNEL]->(ch:Channel)
+                MATCH (a:Agent)-[:OWNS_CHANNEL]->(ch:HubChannel)
                 RETURN ch.channel_id AS channel_id, a.agent_id AS agent_id, a.name AS name
             """)
             async for record in result:
