@@ -303,6 +303,7 @@ def create_app(storage_backend: str | None = None) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         nonlocal telegram_bridge
+        router_refresh_task = None
 
         # Startup
         if os.environ.get("BOOTSTRAP_CHANNELS", "").lower() in ("true", "1", "yes"):
@@ -311,6 +312,7 @@ def create_app(storage_backend: str | None = None) -> Starlette:
 
         if router:
             await router.initialize()
+            router_refresh_task = await router.start_refresh_loop(300.0)
 
         if os.environ.get("TELEGRAM_ENABLED", "").lower() in ("true", "1", "yes"):
             from src.telegram.config import TelegramConfig
@@ -323,6 +325,8 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         yield
 
         # Shutdown
+        if router_refresh_task is not None:
+            router_refresh_task.cancel()
         if telegram_bridge is not None:
             await telegram_bridge.stop()
 

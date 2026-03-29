@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -61,7 +62,7 @@ class HierarchicalRouter:
     async def _load_channel_leads(self) -> None:
         async with self._driver.session() as session:
             result = await session.run("""
-                MATCH (a:Agent)-[:OWNS_CHANNEL]->(ch:HubChannel)
+                MATCH (a:Agent)-[:OWNS_CHANNEL]->(ch:Channel)
                 RETURN ch.channel_id AS channel_id, a.agent_id AS agent_id, a.name AS name
             """)
             async for record in result:
@@ -91,6 +92,26 @@ class HierarchicalRouter:
 
         total_rules = sum(len(v) for v in self._delegates_cache.values())
         logger.info("Router: loaded %d delegation rules", total_rules)
+
+    async def refresh(self) -> None:
+        """Reload routing data from Neo4j. Called periodically."""
+        if not self._driver:
+            return
+        try:
+            await self._load_channel_leads()
+            await self._load_delegation_rules()
+            logger.info("Router: refreshed routing cache")
+        except Exception:
+            logger.warning("Router: cache refresh failed, keeping stale data")
+
+    async def start_refresh_loop(self, interval_seconds: float = 300.0) -> asyncio.Task:
+        """Start background task that refreshes routing cache every interval_seconds."""
+        async def _loop():
+            while True:
+                await asyncio.sleep(interval_seconds)
+                await self.refresh()
+        task = asyncio.create_task(_loop())
+        return task
 
     def get_lead(self, channel_id: str) -> tuple[str, str] | None:
         """Get channel lead (agent_id, name). Returns None if not found."""
