@@ -23,17 +23,29 @@ from src.channels.models import Channel, MemberRole
 from src.channels.permissions import PermissionError, check_can_send
 from src.channels.registry import ChannelRegistry
 from src.hub.aggregator import Aggregator, AggregationStrategy
-from src.hub.fanout import FanOutEngine
+from src.hub.fanout import FanOutEngine, FanOutResult
 from src.storage.base import StorageBackend, StoredMessage
+
+# Router is optional — built by another agent, may not exist yet
+try:
+    from src.hub.router import HierarchicalRouter
+except ImportError:
+    HierarchicalRouter = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("a2a-hub.handler")
 
 
 class GroupChatHub(RequestHandler):
 
-    def __init__(self, registry: ChannelRegistry, storage: StorageBackend) -> None:
+    def __init__(
+        self,
+        registry: ChannelRegistry,
+        storage: StorageBackend,
+        router=None,
+    ) -> None:
         self.registry = registry
         self.storage = storage
+        self._router = router
         self._fanout_engine = FanOutEngine()
         self._aggregator = Aggregator()
         self._tasks: dict[str, Task] = {}
@@ -86,6 +98,117 @@ class GroupChatHub(RequestHandler):
             logger.debug("Memory recall unavailable")
         return memory_context
 
+    # -- Two-phase fan-out helpers -------------------------------------------
+
+    async def _two_phase_fanout(
+        self,
+        channel: Channel,
+        message_parts: list[Part],
+        sender_id: str | None,
+        text: str,
+        msg_meta: dict,
+        memory_context: str,
+    ) -> list[FanOutResult]:
+        """Two-phase fan-out: lead first, then delegates based on @mentions or keywords.
+
+        Falls back to broadcast when router is absent, routing fails, or lead
+        is not in the channel.
+        """
+        routing = None
+        if self._router:
+            try:
+                routing = await self._router.route(channel.channel_id, text)
+            except Exception:
+                logger.warning("Router failed for #%s, falling back to broadcast", channel.name)
+                routing = None
+
+        if routing and routing.strategy != "broadcast_fallback":
+            lead_member = channel.members.get(routing.lead_id)
+            if lead_member:
+                return await self._delegated_fanout(
+                    channel=channel,
+                    message_parts=message_parts,
+                    lead_member=lead_member,
+                    routing=routing,
+                    msg_meta=msg_meta,
+                    memory_context=memory_context,
+                )
+
+        # No router, broadcast fallback, or lead not in channel — original behavior
+        return await self._fanout_engine.fan_out(
+            channel=channel,
+            message_parts=message_parts,
+            sender_id=sender_id,
+            context_id=channel.context_id,
+            message_metadata=msg_meta,
+        )
+
+    async def _delegated_fanout(
+        self,
+        channel: Channel,
+        message_parts: list[Part],
+        lead_member,
+        routing,
+        msg_meta: dict,
+        memory_context: str,
+    ) -> list[FanOutResult]:
+        """Phase 1: send to lead. Phase 2: send to delegates with accumulated context."""
+        # Phase 1: Send to lead
+        try:
+            lead_result = await self._fanout_engine.send_to_single(
+                member=lead_member,
+                message_parts=message_parts,
+                channel=channel,
+                context_id=channel.context_id,
+                message_metadata=msg_meta,
+                memory_context=memory_context,
+                previous_responses=[],
+            )
+        except Exception:
+            logger.error("Lead %s failed, falling back to broadcast", lead_member.name)
+            return await self._fanout_engine.fan_out(
+                channel=channel,
+                message_parts=message_parts,
+                sender_id=None,
+                context_id=channel.context_id,
+                message_metadata=msg_meta,
+            )
+
+        # Phase 2: Parse @mentions from lead's response
+        delegates: list[str] = []
+        if lead_result.response_text and self._router:
+            mentions = self._router.parse_mentions(lead_result.response_text)
+            if mentions:
+                delegates = [
+                    m for m in mentions
+                    if m in channel.members and m != routing.lead_id
+                ]
+
+            # Fallback: keyword-based delegates if no @mentions parsed
+            if not delegates and hasattr(routing, "delegates") and routing.delegates:
+                delegates = [
+                    d for d in routing.delegates
+                    if d in channel.members and d != routing.lead_id
+                ]
+
+        # Send to delegates with accumulated context
+        delegate_results: list[FanOutResult] = []
+        for agent_id in delegates:
+            member = channel.members.get(agent_id)
+            if member:
+                result = await self._fanout_engine.send_to_single(
+                    member=member,
+                    message_parts=message_parts,
+                    channel=channel,
+                    context_id=channel.context_id,
+                    message_metadata=msg_meta,
+                    memory_context=memory_context,
+                    previous_responses=[lead_result] + delegate_results,
+                )
+                delegate_results.append(result)
+
+        return [lead_result] + delegate_results
+
     # -- Core handlers ------------------------------------------------------
 
     async def on_message_send(
@@ -129,20 +252,21 @@ class GroupChatHub(RequestHandler):
         if memory_context:
             msg_meta["memory_context"] = memory_context
 
-        # Fan-out
-        meta = msg_meta
-        strategy_name = meta.get("aggregation", channel.default_aggregation)
+        # Aggregation strategy
+        strategy_name = msg_meta.get("aggregation", channel.default_aggregation)
         try:
             strategy = AggregationStrategy(strategy_name)
         except ValueError:
             strategy = AggregationStrategy.all
 
-        results = await self._fanout_engine.fan_out(
+        # Two-phase fan-out (falls back to broadcast without router)
+        results = await self._two_phase_fanout(
             channel=channel,
             message_parts=params.message.parts,
             sender_id=sender_id,
-            context_id=channel.context_id,
-            message_metadata=msg_meta,
+            text=text,
+            msg_meta=msg_meta,
+            memory_context=memory_context,
         )
 
         # Persist responses
@@ -205,7 +329,6 @@ class GroupChatHub(RequestHandler):
             msg_meta["memory_context"] = memory_context
 
         task_id = str(uuid.uuid4())
-        peers = channel.get_sendable_peers(exclude_agent_id=sender_id)
 
         yield TaskStatusUpdateEvent(
             taskId=task_id,
@@ -216,30 +339,31 @@ class GroupChatHub(RequestHandler):
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 message=Message(
                     role=Role.agent,
-                    parts=[Part(root=TextPart(text=f"Broadcasting to {len(peers)} agents in #{channel.name}..."))],
+                    parts=[Part(root=TextPart(text=f"Routing message in #{channel.name}..."))],
                     message_id=str(uuid.uuid4()),
                 ),
             ),
         )
 
-        # Fan-out with streaming results via as_completed
-        results = await self._fanout_engine.fan_out(
+        # Two-phase fan-out (falls back to broadcast without router)
+        results = await self._two_phase_fanout(
             channel=channel,
             message_parts=params.message.parts,
             sender_id=sender_id,
-            context_id=channel.context_id,
-            message_metadata=msg_meta,
+            text=text,
+            msg_meta=msg_meta,
+            memory_context=memory_context,
         )
 
         for i, r in enumerate(results):
-            text = r.error and f"[Error]: {r.error}" or r.response_text or "[No response]"
+            resp_text = r.error and f"[Error]: {r.error}" or r.response_text or "[No response]"
             yield TaskArtifactUpdateEvent(
                 taskId=task_id,
                 contextId=channel.context_id,
                 artifact=Artifact(
                     artifact_id=f"{task_id}-{i}",
                     name=f"Response from {r.agent_name}",
-                    parts=[Part(root=TextPart(text=text))],
+                    parts=[Part(root=TextPart(text=resp_text))],
                 ),
             )
 
@@ -253,7 +377,7 @@ class GroupChatHub(RequestHandler):
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 message=Message(
                     role=Role.agent,
-                    parts=[Part(root=TextPart(text=f"All {len(peers)} agents responded in #{channel.name}"))],
+                    parts=[Part(root=TextPart(text=f"{len(results)} agent(s) responded in #{channel.name}"))],
                     message_id=str(uuid.uuid4()),
                 ),
             ),

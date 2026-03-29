@@ -160,3 +160,139 @@ class TestFanOutEngine:
 
             assert len(sent_parts) == 1
             assert sent_parts[0].root.text.startswith("[Kanál: #dev-team |")
+
+
+class TestSendToSingle:
+    """Tests for send_to_single with enriched context."""
+
+    async def test_send_to_single_includes_memory_context(self, channel):
+        """send_to_single should include memory context in the message."""
+        engine = FanOutEngine()
+
+        with patch("src.hub.fanout.A2AClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_response = MagicMock()
+            mock_result = MagicMock()
+            mock_result.result = MagicMock(spec=[])
+            mock_result.result.parts = []
+            mock_response.root = mock_result
+            mock_instance.send_message = AsyncMock(return_value=mock_response)
+            MockClient.return_value = mock_instance
+
+            target = channel.members["pixel"]
+            await engine.send_to_single(
+                member=target,
+                message_parts=[Part(root=TextPart(text="Fix the CSS"))],
+                channel=channel,
+                context_id="ctx",
+                memory_context="[Relevantní historie]\n- rex: mentioned CSS issue yesterday",
+            )
+
+            call_args = mock_instance.send_message.call_args
+            request = call_args[0][0]
+            sent_text = request.params.message.parts[0].root.text
+
+            assert "[Kanál: #dev-team |" in sent_text
+            assert "Relevantní historie" in sent_text
+            assert "rex: mentioned CSS issue" in sent_text
+            assert "Fix the CSS" in sent_text
+
+    async def test_send_to_single_includes_previous_responses(self, channel):
+        """send_to_single should include previous responses in context."""
+        engine = FanOutEngine()
+
+        with patch("src.hub.fanout.A2AClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_response = MagicMock()
+            mock_result = MagicMock()
+            mock_result.result = MagicMock(spec=[])
+            mock_result.result.parts = []
+            mock_response.root = mock_result
+            mock_instance.send_message = AsyncMock(return_value=mock_response)
+            MockClient.return_value = mock_instance
+
+            target = channel.members["pixel"]
+            prev = [
+                FanOutResult(agent_id="apollo", agent_name="Apollo",
+                             response_text="Delegate to pixel for CSS work"),
+            ]
+            await engine.send_to_single(
+                member=target,
+                message_parts=[Part(root=TextPart(text="Fix the CSS"))],
+                channel=channel,
+                context_id="ctx",
+                previous_responses=prev,
+            )
+
+            call_args = mock_instance.send_message.call_args
+            request = call_args[0][0]
+            sent_text = request.params.message.parts[0].root.text
+
+            assert "[Odpovědi v tomto kole]" in sent_text
+            assert "Apollo: Delegate to pixel" in sent_text
+
+    async def test_send_to_single_truncates_responses(self, channel):
+        """Previous responses should be truncated to 500 chars."""
+        engine = FanOutEngine()
+
+        with patch("src.hub.fanout.A2AClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_response = MagicMock()
+            mock_result = MagicMock()
+            mock_result.result = MagicMock(spec=[])
+            mock_result.result.parts = []
+            mock_response.root = mock_result
+            mock_instance.send_message = AsyncMock(return_value=mock_response)
+            MockClient.return_value = mock_instance
+
+            target = channel.members["pixel"]
+            long_text = "x" * 1000
+            prev = [
+                FanOutResult(agent_id="apollo", agent_name="Apollo",
+                             response_text=long_text),
+            ]
+            await engine.send_to_single(
+                member=target,
+                message_parts=[Part(root=TextPart(text="Hello"))],
+                channel=channel,
+                context_id="ctx",
+                previous_responses=prev,
+            )
+
+            call_args = mock_instance.send_message.call_args
+            request = call_args[0][0]
+            sent_text = request.params.message.parts[0].root.text
+
+            # Should contain at most 500 x's from the truncated response
+            apollo_line = [l for l in sent_text.split("\n") if "Apollo:" in l][0]
+            # "- Apollo: " prefix + 500 x's
+            assert len(apollo_line) <= len("- Apollo: ") + 500
+
+    async def test_context_prefix_override_used_in_send_to_agent(self, channel):
+        """_send_to_agent should use context_prefix_override when provided."""
+        engine = FanOutEngine()
+
+        with patch("src.hub.fanout.A2AClient") as MockClient:
+            mock_instance = MagicMock()
+            mock_response = MagicMock()
+            mock_result = MagicMock()
+            mock_result.result = MagicMock(spec=[])
+            mock_result.result.parts = []
+            mock_response.root = mock_result
+            mock_instance.send_message = AsyncMock(return_value=mock_response)
+            MockClient.return_value = mock_instance
+
+            target = channel.members["pixel"]
+            custom_prefix = "[Custom context prefix]\n"
+            await engine._send_to_agent(
+                target, message_parts=[Part(root=TextPart(text="Hello"))],
+                channel=channel, context_id="ctx",
+                context_prefix_override=custom_prefix,
+            )
+
+            call_args = mock_instance.send_message.call_args
+            request = call_args[0][0]
+            sent_text = request.params.message.parts[0].root.text
+
+            assert sent_text.startswith("[Custom context prefix]")
+            assert sent_text.endswith("Hello")

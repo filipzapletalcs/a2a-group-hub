@@ -93,6 +93,43 @@ class FanOutEngine:
                 await asyncio.sleep(fan_out_delay)
         return results
 
+    async def send_to_single(
+        self,
+        member: ChannelMember,
+        message_parts: list[Part],
+        channel: Channel,
+        context_id: str,
+        message_metadata: dict | None = None,
+        memory_context: str = "",
+        previous_responses: list[FanOutResult] | None = None,
+    ) -> FanOutResult:
+        """Send to a single agent with enriched context including previous responses."""
+        # Build channel context prefix
+        member_list = []
+        for m in channel.members.values():
+            role_tag = f" ({m.role.value})" if m.role.value != "member" else ""
+            member_list.append(f"{m.name}{role_tag}")
+        context_prefix = f"[Kanál: #{channel.name} | Členové: {', '.join(member_list)}]\n"
+
+        # Add memory context (from Qdrant recall)
+        if memory_context:
+            context_prefix += f"\n{memory_context}\n"
+
+        # Add accumulated responses from this round
+        if previous_responses:
+            responses_text = "\n".join(
+                f"- {r.agent_name}: {r.response_text[:500]}"
+                for r in previous_responses if r.response_text
+            )
+            if responses_text:
+                context_prefix += f"\n[Odpovědi v tomto kole]\n{responses_text}\n"
+
+        return await self._send_to_agent(
+            member, message_parts=message_parts, channel=channel,
+            context_id=context_id, metadata=message_metadata,
+            context_prefix_override=context_prefix,
+        )
+
     async def _send_to_agent(
         self,
         member: ChannelMember,
@@ -100,17 +137,21 @@ class FanOutEngine:
         channel: Channel,
         context_id: str,
         metadata: dict | None = None,
+        context_prefix_override: str | None = None,
     ) -> FanOutResult:
         """Send a message to a single agent via A2A SendMessage."""
         try:
             client = A2AClient(httpx_client=self._http_client, url=member.url)
 
-            # Build channel context prefix
-            member_list = []
-            for m in channel.members.values():
-                role_tag = f" ({m.role.value})" if m.role.value != "member" else ""
-                member_list.append(f"{m.name}{role_tag}")
-            context_prefix = f"[Kanál: #{channel.name} | Členové: {', '.join(member_list)}]\n"
+            # Use override or build default channel context prefix
+            if context_prefix_override is not None:
+                context_prefix = context_prefix_override
+            else:
+                member_list = []
+                for m in channel.members.values():
+                    role_tag = f" ({m.role.value})" if m.role.value != "member" else ""
+                    member_list.append(f"{m.name}{role_tag}")
+                context_prefix = f"[Kanál: #{channel.name} | Členové: {', '.join(member_list)}]\n"
 
             # Prepend channel context to message text
             enriched_parts = []

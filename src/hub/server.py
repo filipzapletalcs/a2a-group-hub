@@ -25,6 +25,12 @@ from src.channels.models import Channel, ChannelMember, MemberRole
 from src.channels.registry import ChannelRegistry
 from src.hub.handler import GroupChatHub
 from src.storage.memory import InMemoryBackend
+
+# Router is optional — may not exist yet
+try:
+    from src.hub.router import HierarchicalRouter
+except ImportError:
+    HierarchicalRouter = None  # type: ignore[assignment,misc]
 from src.storage.base import StorageBackend
 from src.bootstrap import bootstrap_channels
 
@@ -103,8 +109,16 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         )
         storage = InMemoryBackend()
 
+    # Initialize hierarchical router (requires Neo4j + router module)
+    router = None
+    if backend == "composite" and HierarchicalRouter is not None:
+        try:
+            router = HierarchicalRouter(neo4j_driver=neo4j._driver)  # noqa: SLF001
+        except Exception:
+            logger.warning("Could not create HierarchicalRouter — routing disabled")
+
     registry = ChannelRegistry(storage)
-    hub = GroupChatHub(registry=registry, storage=storage)
+    hub = GroupChatHub(registry=registry, storage=storage, router=router)
 
     # -- REST route handlers ------------------------------------------------
 
@@ -294,6 +308,9 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         if os.environ.get("BOOTSTRAP_CHANNELS", "").lower() in ("true", "1", "yes"):
             logger.info("BOOTSTRAP_CHANNELS enabled — running channel bootstrap")
             await bootstrap_channels(registry)
+
+        if router:
+            await router.initialize()
 
         if os.environ.get("TELEGRAM_ENABLED", "").lower() in ("true", "1", "yes"):
             from src.telegram.config import TelegramConfig
