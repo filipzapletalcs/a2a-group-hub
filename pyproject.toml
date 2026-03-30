@@ -19,13 +19,17 @@ storage = [
     "voyageai>=0.3",
 ]
 telegram = ["python-telegram-bot>=22.0"]
+graphiti = [
+    "graphiti-core[voyageai]>=0.28.2",
+    "openai>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "httpx",
     "ruff>=0.8",
 ]
-all = ["a2a-group-hub[llm,storage,telegram,dev]"]
+all = ["a2a-group-hub[llm,storage,telegram,graphiti,dev]"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
