@@ -10,6 +10,13 @@ import logging
 import os
 import uuid
 
+from a2a.types import (
+    Message as A2AMessage,
+    MessageSendParams,
+    Part,
+    Role,
+    TextPart,
+)
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -32,7 +39,14 @@ def create_github_webhook_handler(hub):
             logger.error("GITHUB_WEBHOOK_SECRET not configured")
             return JSONResponse({"error": "Webhook not configured"}, status_code=503)
 
-        signature = request.headers.get("X-Hub-Signature-256", "")
+        signature = request.headers.get("X-Hub-Signature-256")
+        if not signature:
+            logger.warning(
+                "GitHub webhook request missing X-Hub-Signature-256 header (source: %s)",
+                request.client.host if request.client else "unknown",
+            )
+            return JSONResponse({"error": "Missing signature"}, status_code=401)
+
         body = await request.body()
 
         expected = "sha256=" + hmac.new(
@@ -40,14 +54,21 @@ def create_github_webhook_handler(hub):
         ).hexdigest()
 
         if not hmac.compare_digest(signature, expected):
-            logger.warning("Invalid GitHub webhook signature")
+            logger.warning(
+                "Invalid GitHub webhook signature (source: %s)",
+                request.client.host if request.client else "unknown",
+            )
             return JSONResponse({"error": "Invalid signature"}, status_code=403)
 
         # 2. Parse event type and payload
         event_type = request.headers.get("X-GitHub-Event", "")
         try:
             payload = json.loads(body)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "GitHub webhook received invalid JSON (event=%s, body_len=%d): %s",
+                event_type, len(body), exc,
+            )
             return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
         logger.info("GitHub webhook: event=%s", event_type)
@@ -78,35 +99,50 @@ def create_github_webhook_handler(hub):
                 )
 
                 try:
-                    from a2a.types import (
-                        Message as A2AMessage,
-                        MessageSendParams,
-                        Part,
-                        Role,
-                        TextPart,
-                    )
-
                     msg = A2AMessage(
                         role=Role.user,
                         parts=[Part(root=TextPart(text=message_text))],
                         messageId=str(uuid.uuid4()),
                         metadata={
                             "channel_id": "dev-team",
-                            "sender_id": "github-webhook",
+                            # sender_id omitted -- external webhook bypasses member check
+                            "source": "github-webhook",
                         },
                     )
                     params = MessageSendParams(message=msg)
-                    await hub.on_message_send(params)
+                    result = await hub.on_message_send(params)
+
+                    # Check if hub returned an error Message instead of a Task
+                    if isinstance(result, A2AMessage):
+                        error_text = ""
+                        if result.parts:
+                            part = result.parts[0]
+                            if hasattr(part, "root") and hasattr(part.root, "text"):
+                                error_text = part.root.text
+                        logger.error(
+                            "Hub rejected PR #%s routing: %s", pr_number, error_text
+                        )
+                        return JSONResponse(
+                            {"error": f"Hub rejected: {error_text}"}, status_code=502
+                        )
+
                     logger.info(
                         "Routed PR #%s (%s) to dev-team", pr_number, action
                     )
                 except Exception:
-                    logger.exception("Failed to route PR event to dev-team")
+                    logger.exception(
+                        "Failed to route PR #%s event to dev-team", pr_number
+                    )
                     return JSONResponse(
                         {"error": "Routing failed"}, status_code=500
                     )
+            else:
+                logger.debug(
+                    "Ignoring PR action=%s for PR #%s",
+                    action, payload.get("pull_request", {}).get("number", "?"),
+                )
 
-        # 5. Acknowledge all other events silently
+        # 5. Acknowledge all other events
         return JSONResponse({"ok": True})
 
     return github_webhook
