@@ -23,6 +23,7 @@ from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
 from src.channels.models import Channel, ChannelMember, MemberRole
 from src.channels.registry import ChannelRegistry
+from src.hub.github_webhook import create_github_webhook_handler
 from src.hub.graphiti_search import GraphitiSearchClient
 from src.hub.handler import GroupChatHub
 from src.observability.metrics import MetricsCollector
@@ -129,6 +130,9 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         metrics=metrics,
         graphiti_search=graphiti_search,
     )
+
+    # GitHub webhook handler (factory needs hub reference for message routing)
+    github_webhook_handler = create_github_webhook_handler(hub)
 
     # -- REST route handlers ------------------------------------------------
 
@@ -376,6 +380,7 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         Route("/api/metrics", api_metrics, methods=["GET"]),
         Route("/api/status", hub_status, methods=["GET"]),
         Route("/api/telegram/webhook", telegram_webhook, methods=["POST"]),
+        Route("/api/webhooks/github", github_webhook_handler, methods=["POST"]),
     ]
 
     middleware = [
