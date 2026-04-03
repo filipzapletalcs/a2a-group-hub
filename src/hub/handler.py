@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -36,6 +38,34 @@ except ImportError:
     HierarchicalRouter = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("a2a-hub.handler")
+
+# NLP correction signal detection (from correction_patterns.py)
+_CORRECTION_SIGNALS = [
+    # Czech
+    r"\bne,?\s+takhle\s+ne\b",
+    r"\bto\s+je\s+blb[eě]\b",
+    r"\bspatn[eě]\b",
+    r"\bnedelej\s+to\b",
+    r"\boprav\b",
+    r"\bne\s+tak\b",
+    r"\bmisto\s+toho\b",
+    # English
+    r"\bwrong\b",
+    r"\bfix\s+this\b",
+    r"\binstead\s+of\b",
+    r"\bdon'?t\s+do\s+that\b",
+    r"\bincorrect\b",
+]
+_CORRECTION_RE = re.compile("|".join(_CORRECTION_SIGNALS), re.IGNORECASE)
+
+_ACTIVE_AGENTS = {
+    "nexus", "apollo", "rex", "pixel", "nova", "swift", "hawk",
+    "iris", "atlas", "scout", "archi", "sage", "vigil",
+}
+
+_NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
+_NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+_NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
 
 class GroupChatHub(RequestHandler):
@@ -117,6 +147,78 @@ class GroupChatHub(RequestHandler):
         except Exception:
             logger.debug("Graphiti search failed in handler")
             return ""
+
+    async def _check_nlp_correction(
+        self, sender_id: str | None, text: str, channel: Channel
+    ) -> None:
+        """Detect correction signals in Filip's messages and store as MEDIUM confidence.
+
+        Only triggers for messages from human users (not agents) that contain
+        correction signal patterns. The correction is attributed to the @mentioned
+        agent or the channel's lead agent.
+        """
+        # Only detect corrections from human users (not agents)
+        if not sender_id or sender_id.lower() in _ACTIVE_AGENTS:
+            return
+
+        if not _CORRECTION_RE.search(text):
+            return
+
+        # Determine target agent -- if message contains @agent_name, use that
+        # Otherwise attribute to channel lead (owner)
+        target_agent = None
+        text_lower = text.lower()
+        for agent_name in _ACTIVE_AGENTS:
+            if f"@{agent_name}" in text_lower:
+                target_agent = agent_name
+                break
+
+        if not target_agent:
+            # Attribute to channel lead (owner)
+            if channel.owner_id:
+                target_agent = channel.owner_id.lower()
+            else:
+                return  # Cannot determine target
+
+        correction_id = f"cor-{uuid.uuid4().hex[:8]}"
+        agent_name_cap = target_agent.capitalize()
+
+        try:
+            from neo4j import AsyncGraphDatabase
+
+            driver = AsyncGraphDatabase.driver(
+                _NEO4J_URI, auth=(_NEO4J_USER, _NEO4J_PASSWORD)
+            )
+            try:
+                async with driver.session() as session:
+                    await session.run(
+                        """
+                        MERGE (cor:Correction {id: $id})
+                        SET cor.agent_id = $agent_id,
+                            cor.text = $text,
+                            cor.confidence = 'MEDIUM',
+                            cor.source = 'nlp_detected',
+                            cor.applied = false,
+                            cor.promoted = false,
+                            cor.created_at = datetime()
+                        WITH cor
+                        MATCH (a:Agent {name: $agent_name_cap})
+                        MERGE (cor)-[:TARGETS]->(a)
+                        """,
+                        id=correction_id,
+                        agent_id=target_agent,
+                        text=text[:2000],
+                        agent_name_cap=agent_name_cap,
+                    )
+                logger.info(
+                    "NLP correction detected: agent=%s, id=%s",
+                    target_agent,
+                    correction_id,
+                )
+            finally:
+                await driver.close()
+        except Exception as e:
+            logger.warning("Failed to store NLP correction: %s", e)
 
     # -- Two-phase fan-out helpers -------------------------------------------
 
@@ -269,6 +371,9 @@ class GroupChatHub(RequestHandler):
             text=text,
             context_id=channel.context_id,
         ))
+
+        # NLP correction detection (fire-and-forget, never blocks message flow)
+        asyncio.create_task(self._check_nlp_correction(sender_id, text, channel))
 
         # Memory recall + Graphiti search in parallel
         incoming_id = params.message.message_id or ""

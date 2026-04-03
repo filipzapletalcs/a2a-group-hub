@@ -199,6 +199,9 @@ class TelegramBridge:
                     response = "Usage: /logs &lt;agent_name&gt;\nExample: /logs apollo"
                 else:
                     response = await self._commands.cmd_logs(args.lower())
+            elif command == "/correct":
+                # /correct needs the full text (not just args) for pattern matching
+                response = await self._commands.cmd_correct(text)
             else:
                 return  # Unknown command -- ignore silently (don't forward to hub either)
 
