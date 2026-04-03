@@ -12,30 +12,21 @@ logger = logging.getLogger("a2a-hub.commands")
 
 # Agent service registry — name, port, model tier, team
 AGENT_SERVICES: dict[str, dict] = {
-    "nexus": {"port": 9001, "model": "opus", "team": "executive"},
-    "apollo": {"port": 9002, "model": "opus", "team": "dev"},
-    "rex": {"port": 9003, "model": "opus", "team": "dev"},
+    # OpenClaw agents (internal port 18800)
+    "nexus": {"port": 18800, "model": "opus", "team": "executive"},
+    "apollo": {"port": 18800, "model": "opus", "team": "dev"},
+    "rex": {"port": 18800, "model": "opus", "team": "dev"},
+    "sage": {"port": 18800, "model": "opus", "team": "knowledge"},
+    "archi": {"port": 18800, "model": "sonnet", "team": "knowledge"},
+    "vigil": {"port": 18800, "model": "opus", "team": "audit"},
+    "iris": {"port": 18800, "model": "sonnet", "team": "ops"},
+    "atlas": {"port": 18800, "model": "sonnet", "team": "pm"},
+    "scout": {"port": 18800, "model": "sonnet", "team": "knowledge"},
+    # Lightweight agents (direct port)
     "pixel": {"port": 9004, "model": "opus", "team": "dev"},
     "nova": {"port": 9005, "model": "opus", "team": "dev"},
     "swift": {"port": 9006, "model": "opus", "team": "dev"},
     "hawk": {"port": 9007, "model": "opus", "team": "dev"},
-    "sentinel": {"port": 9008, "model": "opus", "team": "testing"},
-    "shield": {"port": 9009, "model": "sonnet", "team": "testing"},
-    "phantom": {"port": 9010, "model": "sonnet", "team": "testing"},
-    "lens": {"port": 9011, "model": "sonnet", "team": "testing"},
-    "aria": {"port": 9012, "model": "sonnet", "team": "testing"},
-    "forge": {"port": 9013, "model": "opus", "team": "ops"},
-    "bolt": {"port": 9014, "model": "sonnet", "team": "ops"},
-    "iris": {"port": 9015, "model": "sonnet", "team": "ops"},
-    "kai": {"port": 9016, "model": "sonnet", "team": "ops"},
-    "mona": {"port": 9017, "model": "opus", "team": "pm"},
-    "atlas": {"port": 9018, "model": "sonnet", "team": "pm"},
-    "echo": {"port": 9019, "model": "sonnet", "team": "pm"},
-    "sage": {"port": 9020, "model": "opus", "team": "knowledge"},
-    "quill": {"port": 9021, "model": "sonnet", "team": "knowledge"},
-    "scout": {"port": 9022, "model": "sonnet", "team": "knowledge"},
-    "archi": {"port": 9023, "model": "sonnet", "team": "knowledge"},
-    "vigil": {"port": 9024, "model": "opus", "team": "audit"},
 }
 
 
