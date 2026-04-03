@@ -6,7 +6,7 @@ and registers all 13 active agents with correct roles. Safe to run on every
 restart — only adds missing channels/members, never deletes.
 
 Phase 6 consolidation: 11 lightweight agents dropped, 13 remain.
-OpenClaw agents use internal port 18800 (gateway).
+OpenClaw agents use internal port 18789 (gateway).
 Lightweight Python agents use their assigned port directly.
 """
 
@@ -20,19 +20,19 @@ from src.channels.registry import ChannelRegistry
 logger = logging.getLogger("a2a-hub.bootstrap")
 
 # Agent port assignments (must match docker-compose)
-# OpenClaw agents listen on 18800 internally (gateway plugin)
+# OpenClaw agents listen on 18789 internally (gateway plugin)
 # Lightweight Python agents listen on their assigned port
 AGENT_PORTS: dict[str, int] = {
-    # OpenClaw runtime (internal port 18800)
-    "nexus": 18800,
-    "apollo": 18800,
-    "rex": 18800,
-    "sage": 18800,
-    "archi": 18800,
-    "vigil": 18800,
-    "iris": 18800,
-    "atlas": 18800,
-    "scout": 18800,
+    # OpenClaw runtime (internal port 18789)
+    "nexus": 18789,
+    "apollo": 18789,
+    "rex": 18789,
+    "sage": 18789,
+    "archi": 18789,
+    "vigil": 18789,
+    "iris": 18789,
+    "atlas": 18789,
+    "scout": 18789,
     # Lightweight Python agents (direct port)
     "pixel": 9004,
     "nova": 9005,

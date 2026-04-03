@@ -12,16 +12,16 @@ logger = logging.getLogger("a2a-hub.commands")
 
 # Agent service registry — name, port, model tier, team
 AGENT_SERVICES: dict[str, dict] = {
-    # OpenClaw agents (internal port 18800)
-    "nexus": {"port": 18800, "model": "opus", "team": "executive"},
-    "apollo": {"port": 18800, "model": "opus", "team": "dev"},
-    "rex": {"port": 18800, "model": "opus", "team": "dev"},
-    "sage": {"port": 18800, "model": "opus", "team": "knowledge"},
-    "archi": {"port": 18800, "model": "sonnet", "team": "knowledge"},
-    "vigil": {"port": 18800, "model": "opus", "team": "audit"},
-    "iris": {"port": 18800, "model": "sonnet", "team": "ops"},
-    "atlas": {"port": 18800, "model": "sonnet", "team": "pm"},
-    "scout": {"port": 18800, "model": "sonnet", "team": "knowledge"},
+    # OpenClaw agents (internal port 18789)
+    "nexus": {"port": 18789, "model": "opus", "team": "executive"},
+    "apollo": {"port": 18789, "model": "opus", "team": "dev"},
+    "rex": {"port": 18789, "model": "opus", "team": "dev"},
+    "sage": {"port": 18789, "model": "opus", "team": "knowledge"},
+    "archi": {"port": 18789, "model": "sonnet", "team": "knowledge"},
+    "vigil": {"port": 18789, "model": "opus", "team": "audit"},
+    "iris": {"port": 18789, "model": "sonnet", "team": "ops"},
+    "atlas": {"port": 18789, "model": "sonnet", "team": "pm"},
+    "scout": {"port": 18789, "model": "sonnet", "team": "knowledge"},
     # Lightweight agents (direct port)
     "pixel": {"port": 9004, "model": "opus", "team": "dev"},
     "nova": {"port": 9005, "model": "opus", "team": "dev"},
