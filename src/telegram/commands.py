@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import re
-import uuid
 from datetime import datetime, timezone
 
 import httpx
@@ -14,21 +11,22 @@ import httpx
 logger = logging.getLogger("a2a-hub.commands")
 
 # Agent service registry — name, port, model tier, team
-# Phase 6: 13 active agents (11 dropped for Langfuse RAM)
 AGENT_SERVICES: dict[str, dict] = {
-    "nexus": {"port": 9001, "model": "opus", "team": "executive"},
-    "apollo": {"port": 9002, "model": "opus", "team": "dev"},
-    "rex": {"port": 9003, "model": "opus", "team": "dev"},
+    # OpenClaw agents (internal port 18789)
+    "nexus": {"port": 18789, "model": "opus", "team": "executive"},
+    "apollo": {"port": 18789, "model": "opus", "team": "dev"},
+    "rex": {"port": 18789, "model": "opus", "team": "dev"},
+    "sage": {"port": 18789, "model": "opus", "team": "knowledge"},
+    "archi": {"port": 18789, "model": "sonnet", "team": "knowledge"},
+    "vigil": {"port": 18789, "model": "opus", "team": "audit"},
+    "iris": {"port": 18789, "model": "sonnet", "team": "ops"},
+    "atlas": {"port": 18789, "model": "sonnet", "team": "pm"},
+    "scout": {"port": 18789, "model": "sonnet", "team": "knowledge"},
+    # Lightweight agents (direct port)
     "pixel": {"port": 9004, "model": "opus", "team": "dev"},
     "nova": {"port": 9005, "model": "opus", "team": "dev"},
     "swift": {"port": 9006, "model": "opus", "team": "dev"},
     "hawk": {"port": 9007, "model": "opus", "team": "dev"},
-    "iris": {"port": 9015, "model": "sonnet", "team": "dev"},
-    "sage": {"port": 9020, "model": "opus", "team": "knowledge"},
-    "atlas": {"port": 9018, "model": "sonnet", "team": "knowledge"},
-    "scout": {"port": 9022, "model": "sonnet", "team": "knowledge"},
-    "archi": {"port": 9023, "model": "sonnet", "team": "knowledge"},
-    "vigil": {"port": 9024, "model": "opus", "team": "audit"},
 }
 
 
@@ -55,14 +53,6 @@ def _format_uptime(seconds: int | float) -> str:
 class CommandHandler:
     """Handles Telegram admin commands for system monitoring."""
 
-    # Active agents for /correct validation
-    _ACTIVE_AGENTS = {
-        "nexus", "apollo", "rex", "pixel", "nova", "swift", "hawk",
-        "iris", "atlas", "scout", "archi", "sage", "vigil",
-    }
-
-    _CORRECT_PATTERN = re.compile(r"^/correct\s+(\w+)\s+(.+)$", re.DOTALL)
-
     def __init__(
         self,
         http_client: httpx.AsyncClient,
@@ -70,12 +60,9 @@ class CommandHandler:
     ) -> None:
         self._http = http_client
         self._hub_url = hub_base_url.rstrip("/")
-        self._neo4j_uri = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
-        self._neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-        self._neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
 
     # Docker service names differ from agent names for these agents
-    _SERVICE_NAMES = {"swift": "swift-agent"}
+    _SERVICE_NAMES = {"swift": "swift-agent", "echo": "echo-agent"}
 
     async def _check_agent_health(self, agent_name: str) -> dict | None:
         """Check a single agent's /health endpoint. Returns JSON dict or None."""
@@ -294,63 +281,3 @@ class CommandHandler:
             f"Log proxy endpoint planned for future\n"
             f"enhancement.</pre>"
         )
-
-    async def cmd_correct(self, text: str) -> str:
-        """Handle /correct <agent> <correction_text> command.
-
-        Stores correction as HIGH confidence :Correction node in Neo4j.
-        """
-        match = self._CORRECT_PATTERN.match(text.strip())
-        if not match:
-            return (
-                "Usage: /correct &lt;agent&gt; &lt;text&gt;\n"
-                "Example: /correct apollo Neformatuj odpovedi jako seznam, pouzij prirozenou rec"
-            )
-
-        agent_name = match.group(1).lower()
-        correction_text = match.group(2).strip()
-
-        if agent_name not in self._ACTIVE_AGENTS:
-            return f"Unknown agent: {agent_name}\nActive agents: {', '.join(sorted(self._ACTIVE_AGENTS))}"
-
-        correction_id = f"cor-{uuid.uuid4().hex[:8]}"
-        agent_name_cap = agent_name.capitalize()
-
-        try:
-            from neo4j import AsyncGraphDatabase
-
-            driver = AsyncGraphDatabase.driver(
-                self._neo4j_uri, auth=(self._neo4j_user, self._neo4j_password)
-            )
-            try:
-                async with driver.session() as session:
-                    await session.run(
-                        """
-                        MERGE (cor:Correction {id: $id})
-                        SET cor.agent_id = $agent_id,
-                            cor.text = $text,
-                            cor.confidence = 'HIGH',
-                            cor.source = 'explicit',
-                            cor.applied = false,
-                            cor.promoted = false,
-                            cor.created_at = datetime()
-                        WITH cor
-                        MATCH (a:Agent {name: $agent_name_cap})
-                        MERGE (cor)-[:TARGETS]->(a)
-                        """,
-                        id=correction_id,
-                        agent_id=agent_name,
-                        text=correction_text,
-                        agent_name_cap=agent_name_cap,
-                    )
-
-                return (
-                    f"Correction stored for <b>{agent_name}</b> (HIGH confidence)\n"
-                    f"ID: <code>{correction_id}</code>\n"
-                    f"Text: {correction_text[:200]}"
-                )
-            finally:
-                await driver.close()
-        except Exception as e:
-            logger.error("Failed to store correction: %s", e)
-            return f"Failed to store correction: {e}"

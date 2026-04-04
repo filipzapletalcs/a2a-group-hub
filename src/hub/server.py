@@ -24,6 +24,7 @@ from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from src.channels.models import Channel, ChannelMember, MemberRole
 from src.channels.registry import ChannelRegistry
 from src.hub.github_webhook import create_github_webhook_handler
+from src.hub.callback import CallbackStore, handle_callback, run_callback_cleanup
 from src.hub.graphiti_search import GraphitiSearchClient
 from src.hub.handler import GroupChatHub
 from src.observability.metrics import MetricsCollector
@@ -123,12 +124,14 @@ def create_app(storage_backend: str | None = None) -> Starlette:
     metrics = MetricsCollector()
     registry = ChannelRegistry(storage)
     graphiti_search = GraphitiSearchClient()
+    callback_store = CallbackStore(timeout=120.0)
     hub = GroupChatHub(
         registry=registry,
         storage=storage,
         router=router,
         metrics=metrics,
         graphiti_search=graphiti_search,
+        callback_store=callback_store,
     )
 
     # GitHub webhook handler (factory needs hub reference for message routing)
@@ -381,6 +384,7 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         Route("/api/status", hub_status, methods=["GET"]),
         Route("/api/telegram/webhook", telegram_webhook, methods=["POST"]),
         Route("/api/webhooks/github", github_webhook_handler, methods=["POST"]),
+        Route("/api/callback", handle_callback, methods=["POST"]),
     ]
 
     middleware = [
@@ -402,6 +406,10 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         # Initialize Graphiti search (fire-and-forget: works or silently disabled)
         await graphiti_search.initialize()
 
+        # Start callback cleanup background task
+        import asyncio as _asyncio
+        cleanup_task = _asyncio.create_task(run_callback_cleanup(callback_store))
+
         if router:
             await router.initialize()
             router_refresh_task = await router.start_refresh_loop(300.0)
@@ -417,6 +425,7 @@ def create_app(storage_backend: str | None = None) -> Starlette:
         yield
 
         # Shutdown
+        cleanup_task.cancel()
         if router_refresh_task is not None:
             router_refresh_task.cancel()
         if telegram_bridge is not None:
@@ -464,5 +473,6 @@ def create_app(storage_backend: str | None = None) -> Starlette:
     app.state.registry = registry
     app.state.storage = storage
     app.state.metrics = metrics
+    app.state.callback_store = callback_store
 
     return app

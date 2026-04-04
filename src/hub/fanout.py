@@ -18,8 +18,16 @@ from a2a.types import (
 )
 
 from src.channels.models import Channel, ChannelMember, MemberRole
+from src.hub.callback import CallbackStore
 
 logger = logging.getLogger("a2a-hub.fanout")
+
+
+# ---------------------------------------------------------------------------
+# Async agent set — OpenClaw agents using the callback pattern (port 18800)
+# ---------------------------------------------------------------------------
+
+ASYNC_AGENTS: set[str] = {"nexus", "apollo", "rex", "sage", "vigil"}
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +107,12 @@ class FanOutEngine:
         self,
         http_client: httpx.AsyncClient | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        callback_store: CallbackStore | None = None,
     ) -> None:
         self._http_client = http_client or httpx.AsyncClient(timeout=120.0)
         self._owns_client = http_client is None
         self._circuit_breaker = circuit_breaker or CircuitBreaker()
+        self._callback_store = callback_store  # None = sync-only mode
 
     @property
     def circuit_breaker(self) -> CircuitBreaker:
@@ -141,11 +151,18 @@ class FanOutEngine:
 
         # Fire-and-forget to observers (tracked with error logging callback)
         for obs in observers:
-            task = asyncio.create_task(
-                self._send_to_agent(obs, message_parts=message_parts, channel=channel,
-                                     context_id=context_id, metadata=message_metadata),
-                name=f"observer-{obs.agent_id}",
-            )
+            if obs.agent_id in ASYNC_AGENTS:
+                task = asyncio.create_task(
+                    self._send_to_agent_async(obs, message_parts=message_parts, channel=channel,
+                                               context_id=context_id, metadata=message_metadata),
+                    name=f"observer-{obs.agent_id}",
+                )
+            else:
+                task = asyncio.create_task(
+                    self._send_to_agent(obs, message_parts=message_parts, channel=channel,
+                                         context_id=context_id, metadata=message_metadata),
+                    name=f"observer-{obs.agent_id}",
+                )
             task.add_done_callback(self._observer_done_callback)
 
         if not sendable:
@@ -166,10 +183,17 @@ class FanOutEngine:
                 ))
                 continue
 
-            result = await self._send_to_agent(
-                member, message_parts=message_parts, channel=channel,
-                context_id=context_id, metadata=message_metadata,
-            )
+            # Dispatch: async callback for OpenClaw agents, sync for lightweight
+            if member.agent_id in ASYNC_AGENTS:
+                result = await self._send_to_agent_async(
+                    member, message_parts=message_parts, channel=channel,
+                    context_id=context_id, metadata=message_metadata,
+                )
+            else:
+                result = await self._send_to_agent(
+                    member, message_parts=message_parts, channel=channel,
+                    context_id=context_id, metadata=message_metadata,
+                )
 
             # ACK/NACK tracking
             if result.error:
@@ -188,7 +212,11 @@ class FanOutEngine:
 
             results.append(result)
             if i < len(sendable) - 1 and fan_out_delay > 0:
-                await asyncio.sleep(fan_out_delay)
+                # Skip delay for async agents (202 is instant)
+                if member.agent_id not in ASYNC_AGENTS:
+                    await asyncio.sleep(fan_out_delay)
+                else:
+                    await asyncio.sleep(0.1)  # minimal delay for async
         return results
 
     async def send_to_single(
@@ -216,7 +244,7 @@ class FanOutEngine:
         for m in channel.members.values():
             role_tag = f" ({m.role.value})" if m.role.value != "member" else ""
             member_list.append(f"{m.name}{role_tag}")
-        context_prefix = f"[Kanál: #{channel.name} | Členové: {', '.join(member_list)}]\n"
+        context_prefix = f"[Kanal: #{channel.name} | Clenove: {', '.join(member_list)}]\n"
 
         # Add memory context (from Qdrant recall)
         if memory_context:
@@ -231,11 +259,19 @@ class FanOutEngine:
             if responses_text:
                 context_prefix += f"\n[Odpovědi v tomto kole]\n{responses_text}\n"
 
-        result = await self._send_to_agent(
-            member, message_parts=message_parts, channel=channel,
-            context_id=context_id, metadata=message_metadata,
-            context_prefix_override=context_prefix,
-        )
+        # Dispatch: async callback for OpenClaw agents, sync for lightweight
+        if member.agent_id in ASYNC_AGENTS:
+            result = await self._send_to_agent_async(
+                member, message_parts=message_parts, channel=channel,
+                context_id=context_id, metadata=message_metadata,
+                context_prefix_override=context_prefix,
+            )
+        else:
+            result = await self._send_to_agent(
+                member, message_parts=message_parts, channel=channel,
+                context_id=context_id, metadata=message_metadata,
+                context_prefix_override=context_prefix,
+            )
 
         # ACK/NACK tracking
         if result.error:
@@ -244,6 +280,106 @@ class FanOutEngine:
             self._circuit_breaker.record_success(member.agent_id)
 
         return result
+
+    async def _send_to_agent_async(
+        self,
+        member: ChannelMember,
+        message_parts: list[Part],
+        channel: Channel,
+        context_id: str,
+        metadata: dict | None = None,
+        context_prefix_override: str | None = None,
+    ) -> FanOutResult:
+        """Send to OpenClaw agent via async callback pattern: POST message, get 202, await callback."""
+        if self._callback_store is None:
+            logger.warning("No callback store -- falling back to sync for %s", member.name)
+            return await self._send_to_agent(
+                member, message_parts, channel, context_id, metadata, context_prefix_override,
+            )
+
+        try:
+            # Build context prefix
+            if context_prefix_override is not None:
+                context_prefix = context_prefix_override
+            else:
+                member_list = []
+                for m in channel.members.values():
+                    role_tag = f" ({m.role.value})" if m.role.value != "member" else ""
+                    member_list.append(f"{m.name}{role_tag}")
+                context_prefix = f"[Kanal: #{channel.name} | Clenove: {', '.join(member_list)}]\n"
+
+            # Build enriched text from message parts
+            enriched_text = context_prefix
+            for part in message_parts:
+                if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                    enriched_text += part.root.text
+                    break
+
+            # Build A2A-style JSON body (the plugin expects JSONRPC format)
+            body = {
+                "jsonrpc": "2.0",
+                "method": "message/send",
+                "id": str(uuid.uuid4()),
+                "params": {
+                    "message": {
+                        "role": "user",
+                        "parts": [{"type": "text", "text": enriched_text}],
+                        "message_id": str(uuid.uuid4()),
+                        "context_id": context_id,
+                        "metadata": {
+                            **(metadata or {}),
+                            "hub_channel_id": channel.channel_id,
+                            "hub_channel_name": channel.name,
+                        },
+                    },
+                    "configuration": {
+                        "blocking": False,
+                        "accepted_output_modes": ["text"],
+                    },
+                },
+            }
+
+            # POST to plugin — expect 202 with correlation_id
+            response = await self._http_client.post(
+                member.url, json=body, timeout=10.0,
+            )
+
+            if response.status_code not in (200, 202):
+                return FanOutResult(
+                    agent_id=member.agent_id, agent_name=member.name,
+                    error=f"Plugin returned {response.status_code}",
+                )
+
+            resp_data = response.json()
+            correlation_id = resp_data.get("result", {}).get("correlation_id", "") or resp_data.get("correlation_id", "")
+            if not correlation_id:
+                return FanOutResult(
+                    agent_id=member.agent_id, agent_name=member.name,
+                    error="Plugin did not return correlation_id",
+                )
+
+            # Register correlation and await callback
+            future = self._callback_store.register(
+                correlation_id=correlation_id,
+                agent_id=member.agent_id,
+                channel_id=channel.channel_id,
+                context_id=context_id,
+            )
+
+            # Wait for callback (slightly more than store timeout for clean expiry)
+            result_data = await asyncio.wait_for(future, timeout=130.0)
+            text = result_data.get("text", "")
+            return FanOutResult(
+                agent_id=member.agent_id, agent_name=member.name,
+                response_text=text,
+            )
+
+        except asyncio.TimeoutError:
+            logger.error("Async callback timeout for %s (%s)", member.name, member.url)
+            return FanOutResult(agent_id=member.agent_id, agent_name=member.name, error="callback_timeout")
+        except Exception as e:
+            logger.error("Async fan-out to %s (%s) failed: %s", member.name, member.url, e)
+            return FanOutResult(agent_id=member.agent_id, agent_name=member.name, error=str(e))
 
     async def _send_to_agent(
         self,
@@ -266,7 +402,7 @@ class FanOutEngine:
                 for m in channel.members.values():
                     role_tag = f" ({m.role.value})" if m.role.value != "member" else ""
                     member_list.append(f"{m.name}{role_tag}")
-                context_prefix = f"[Kanál: #{channel.name} | Členové: {', '.join(member_list)}]\n"
+                context_prefix = f"[Kanal: #{channel.name} | Clenove: {', '.join(member_list)}]\n"
 
             # Prepend channel context to message text
             enriched_parts = []

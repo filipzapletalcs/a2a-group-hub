@@ -77,6 +77,7 @@ class GroupChatHub(RequestHandler):
         router=None,
         metrics: MetricsCollector | None = None,
         graphiti_search: GraphitiSearchClient | None = None,
+        callback_store=None,
     ) -> None:
         self.registry = registry
         self.storage = storage
@@ -84,7 +85,7 @@ class GroupChatHub(RequestHandler):
         self._metrics = metrics
         self._graphiti_search = graphiti_search
         self._circuit_breaker = CircuitBreaker()
-        self._fanout_engine = FanOutEngine(circuit_breaker=self._circuit_breaker)
+        self._fanout_engine = FanOutEngine(circuit_breaker=self._circuit_breaker, callback_store=callback_store)
         self._aggregator = Aggregator()
         self._tasks: dict[str, Task] = {}
 

@@ -1,9 +1,13 @@
 # src/bootstrap.py
 """Idempotent channel bootstrap for OpenClaw agent topology.
 
-On hub startup (BOOTSTRAP_CHANNELS=true), creates the 7 team channels
-and registers all 24 agents with correct roles. Safe to run on every
+On hub startup (BOOTSTRAP_CHANNELS=true), creates the team channels
+and registers all 13 active agents with correct roles. Safe to run on every
 restart — only adds missing channels/members, never deletes.
+
+Phase 6 consolidation: 11 lightweight agents dropped, 13 remain.
+OpenClaw agents use port 18800 (a2a-bridge plugin).
+Lightweight Python agents use their assigned port directly.
 """
 
 from __future__ import annotations
@@ -16,37 +20,29 @@ from src.channels.registry import ChannelRegistry
 logger = logging.getLogger("a2a-hub.bootstrap")
 
 # Agent port assignments (must match docker-compose)
+# OpenClaw agents listen on 18800 (a2a-bridge plugin)
+# Lightweight Python agents listen on their assigned port
 AGENT_PORTS: dict[str, int] = {
-    "nexus": 9001,
-    "apollo": 9002,
-    "rex": 9003,
+    # OpenClaw agents (a2a-bridge plugin on port 18800)
+    "nexus": 18800,
+    "apollo": 18800,
+    "rex": 18800,
+    "sage": 18800,
+    "vigil": 18800,
+    # Lightweight Python agents (direct A2A on original port)
     "pixel": 9004,
     "nova": 9005,
     "swift": 9006,
     "hawk": 9007,
-    "sentinel": 9008,
-    "shield": 9009,
-    "phantom": 9010,
-    "lens": 9011,
-    "aria": 9012,
-    "forge": 9013,
-    "bolt": 9014,
     "iris": 9015,
-    "kai": 9016,
-    "mona": 9017,
     "atlas": 9018,
-    "echo": 9019,
-    "sage": 9020,
-    "quill": 9021,
     "scout": 9022,
     "archi": 9023,
-    "vigil": 9024,
 }
 
 # Docker service names that differ from agent_id
 _SERVICE_NAMES: dict[str, str] = {
     "swift": "swift-agent",
-    "echo": "echo-agent",
 }
 
 
@@ -57,13 +53,14 @@ def _agent_url(agent_id: str) -> str:
     return f"http://{service}:{port}/"
 
 
-# Channel definitions: channel_id -> (name, owner, members, observers)
+# Channel definitions after Phase 6 consolidation (13 agents, 3 channels)
+# Dropped: testing-team, ops-team, pm-team (owners/members removed)
 OPENCLAW_CHANNELS: list[dict] = [
     {
         "channel_id": "leaders",
         "name": "#leaders",
         "owner": "nexus",
-        "members": ["apollo", "sentinel", "forge", "mona", "sage"],
+        "members": ["apollo", "sage"],
         "observers": ["vigil"],
     },
     {
@@ -74,31 +71,10 @@ OPENCLAW_CHANNELS: list[dict] = [
         "observers": ["vigil"],
     },
     {
-        "channel_id": "testing-team",
-        "name": "#testing-team",
-        "owner": "sentinel",
-        "members": ["shield", "phantom", "lens", "aria"],
-        "observers": [],
-    },
-    {
-        "channel_id": "ops-team",
-        "name": "#ops-team",
-        "owner": "forge",
-        "members": ["bolt", "iris", "kai"],
-        "observers": [],
-    },
-    {
-        "channel_id": "pm-team",
-        "name": "#pm-team",
-        "owner": "mona",
-        "members": ["atlas", "echo"],
-        "observers": [],
-    },
-    {
         "channel_id": "knowledge-team",
         "name": "#knowledge-team",
         "owner": "sage",
-        "members": ["quill", "scout", "archi"],
+        "members": ["scout", "archi"],
         "observers": [],
     },
     {
