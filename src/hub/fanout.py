@@ -351,7 +351,7 @@ class FanOutEngine:
                 )
 
             resp_data = response.json()
-            correlation_id = resp_data.get("correlation_id", "")
+            correlation_id = resp_data.get("result", {}).get("correlation_id", "") or resp_data.get("correlation_id", "")
             if not correlation_id:
                 return FanOutResult(
                     agent_id=member.agent_id, agent_name=member.name,
